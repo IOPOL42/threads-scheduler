@@ -1,0 +1,5 @@
+.env
+*.log
+published_tracking.json
+__pycache__/
+*.pyc
