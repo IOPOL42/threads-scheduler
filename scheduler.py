@@ -6,6 +6,8 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 import logging
 
+_SAFE_ID_RE = re.compile(r'^[a-zA-Z0-9_\-]{1,128}$')
+
 # ─── Логирование ─────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -398,6 +400,9 @@ def run():
             continue  # ещё рано
 
         post_id = post["id"]
+        if not _SAFE_ID_RE.match(str(post_id)):
+            log.error(f"❌ Небезопасный post_id: {str(post_id)[:40]!r} — пропускаем")
+            continue
         parts = parse_thread(post["content"])
         media = post.get("media_urls") or []
 
