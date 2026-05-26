@@ -5,6 +5,9 @@ on:
     - cron: '*/5 * * * *'  # каждые 5 минут
   workflow_dispatch:        # ручной запуск из GitHub UI
 
+permissions:
+  contents: read
+
 concurrency:
   group: scheduler
   cancel-in-progress: false  # не отменять запущенный — посты должны дойти
