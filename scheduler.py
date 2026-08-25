@@ -391,33 +391,41 @@ def run():
     posts = load_ready_posts()
     published = 0
     for post in posts:
-        queued_at_str = post.get("queued_at")
-        if not queued_at_str:
-            continue
+        post_id = post.get("id")
         try:
+            queued_at_str = post.get("queued_at")
+            if not queued_at_str:
+                continue
             queued_at = datetime.fromisoformat(queued_at_str.replace("Z", "+00:00"))
-        except (ValueError, AttributeError):
-            continue
+            if queued_at.tzinfo is None:
+                queued_at = queued_at.replace(tzinfo=TZ)
+            if now < queued_at:
+                continue  # ещё рано
 
-        if now < queued_at:
-            continue  # ещё рано
+            if not _SAFE_ID_RE.match(str(post_id)):
+                log.error(f"❌ Небезопасный post_id: {str(post_id)[:40]!r} — пропускаем")
+                continue
 
-        post_id = post["id"]
-        if not _SAFE_ID_RE.match(str(post_id)):
-            log.error(f"❌ Небезопасный post_id: {str(post_id)[:40]!r} — пропускаем")
-            continue
-        parts = parse_thread(post["content"])
-        media = post.get("media") or []
+            parts = parse_thread(post.get("content") or "")
+            media = post.get("media") or []
 
-        log.info(f"🕐 Публикуем {post_id[:8]}... ({len(parts)} частей, {queued_at.astimezone(TZ).strftime('%H:%M')})")
+            log.info(f"🕐 Публикуем {post_id[:8]}... ({len(parts)} частей, {queued_at.astimezone(TZ).strftime('%H:%M')})")
 
-        too_long = [i+1 for i, t in enumerate(parts) if len(t) > MAX_POST_LEN]
-        if too_long:
-            max_len = max(len(t) for t in parts)
-            log.warning(f"⚠️ Пост {post_id[:8]}...: слишком длинная часть {too_long} ({max_len} симв.) — пропускаем")
-            continue
+            too_long = [i+1 for i, t in enumerate(parts) if len(t) > MAX_POST_LEN]
+            if too_long:
+                max_len = max(len(t) for t in parts)
+                msg = f"Слишком длинная часть {too_long} ({max_len} симв., максимум {MAX_POST_LEN})"
+                log.warning(f"⚠️ Пост {post_id[:8]}...: {msg} — пропускаем")
+                clear_queued(post_id, error=msg)
+                continue
 
-        try:
+            # Claim the slot *before* calling the Threads API: if we crash or
+            # the network dies anywhere between a successful publish and the
+            # mark_published() call below, queued_at is already cleared here,
+            # so the next run's query (status=ready AND queued_at IS NOT NULL)
+            # will never pick this post up again and re-publish it.
+            clear_queued(post_id)
+
             threads_ids, pub_error = publish_parts(parts, media=media or None)
             if threads_ids:
                 mark_published(post_id)
@@ -427,8 +435,11 @@ def run():
                 log.error(f"❌ Пост {post_id[:8]}...: {pub_error or 'ошибка публикации'}")
                 clear_queued(post_id, error=pub_error)
         except Exception as e:
-            log.exception(f"❌ Непредвиденная ошибка при публикации {post_id[:8]}...: {e}")
-            clear_queued(post_id, error=str(e))
+            log.exception(f"❌ Непредвиденная ошибка при обработке поста {str(post_id)[:8]}...: {e}")
+            try:
+                clear_queued(post_id, error=str(e))
+            except Exception:
+                pass
 
     log.info(f"🏁 Готово. Опубликовано: {published}")
 
