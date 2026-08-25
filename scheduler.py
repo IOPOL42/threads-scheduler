@@ -331,16 +331,19 @@ def publish_container(container_id: str) -> str | None:
     return r.json().get("id")
 
 
-def publish_parts(parts: list[str], media_urls: list[str] = None) -> tuple[list[str] | None, str | None]:
+def publish_parts(parts: list[str], media: list[dict] = None) -> tuple[list[str] | None, str | None]:
     """
     Опубликовать одну или несколько частей ветки.
+    `media` — список {"url": str, "branch": int}, branch — номер ветки (1-indexed,
+    как в UI). Каждой части достаются только медиа с её собственным branch.
     Возвращает (thread_ids, error_message). error_message = None при успехе.
     """
     try:
         post_ids = []
         prev_id = None
         for i, text in enumerate(parts):
-            part_media = media_urls if i == 0 else None
+            branch_no = i + 1
+            part_media = [m["url"] for m in (media or []) if m.get("branch") == branch_no] or None
             container_id = create_container(text, reply_to_id=prev_id, media_urls=part_media)
             if not container_id:
                 return None, "Threads API не вернул ID контейнера"
@@ -404,7 +407,7 @@ def run():
             log.error(f"❌ Небезопасный post_id: {str(post_id)[:40]!r} — пропускаем")
             continue
         parts = parse_thread(post["content"])
-        media = post.get("media_urls") or []
+        media = post.get("media") or []
 
         log.info(f"🕐 Публикуем {post_id[:8]}... ({len(parts)} частей, {queued_at.astimezone(TZ).strftime('%H:%M')})")
 
@@ -415,7 +418,7 @@ def run():
             continue
 
         try:
-            threads_ids, pub_error = publish_parts(parts, media_urls=media or None)
+            threads_ids, pub_error = publish_parts(parts, media=media or None)
             if threads_ids:
                 mark_published(post_id)
                 log.info(f"✅ Пост {post_id[:8]}... опубликован")
