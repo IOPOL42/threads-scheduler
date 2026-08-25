@@ -1,8 +1,9 @@
 import os
 import re
+import sys
 import time
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import logging
 
@@ -40,6 +41,10 @@ MAX_POST_LEN        = 500
 RETRY_MAX_ATTEMPTS  = 5
 RETRY_BASE_DELAY    = 5
 RETRY_BACKOFF       = 3
+
+
+# ─── Статистика вовлечённости ────────────────────────────────────────────────
+STATS_WINDOW_DAYS   = 30  # опрашивать публикации не старше N дней
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -129,14 +134,20 @@ def delete_published_posts(now: datetime):
         log.error(f"❌ Ошибка очистки опубликованных постов: {e}")
 
 
-def mark_published(post_id: str):
-    """Пометить пост как опубликованный."""
+def mark_published(post_id: str, threads_ids: list[str] = None):
+    """Пометить пост как опубликованный. threads_ids уходит в /api/v1/posts/:id,
+    который сам пробрасывает их в лог publications (нужно для опроса статистики)."""
     try:
         request_with_retry(
             "PATCH",
             f"{WORKSPACE_API_URL}/api/v1/posts/{post_id}",
             headers={"X-API-Key": WORKSPACE_API_KEY},
-            json={"status": "published", "published_at": datetime.now(tz=TZ).isoformat(), "queued_at": None},
+            json={
+                "status": "published",
+                "published_at": datetime.now(tz=TZ).isoformat(),
+                "queued_at": None,
+                "threads_ids": threads_ids or [],
+            },
             timeout=API_TIMEOUT_SEC,
         )
     except Exception as e:
@@ -374,6 +385,94 @@ def publish_parts(parts: list[str], media: list[dict] = None) -> tuple[list[str]
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+#  Статистика вовлечённости (архив "залетевших" постов и "стволов")
+# ═════════════════════════════════════════════════════════════════════════════
+def load_recent_publications(since: datetime) -> list[dict]:
+    """Публикации за последние STATS_WINDOW_DAYS дней, у которых есть Threads ID."""
+    r = request_with_retry(
+        "GET",
+        f"{WORKSPACE_API_URL}/api/v1/publications",
+        params={"since": since.isoformat()},
+        headers={"X-API-Key": WORKSPACE_API_KEY},
+        timeout=API_TIMEOUT_SEC,
+    )
+    return r.json().get("publications", [])
+
+
+def get_post_insights(threads_post_id: str) -> tuple[int, int]:
+    """Лайки и просмотры одной публикации Threads. (0, 0) при ошибке."""
+    try:
+        r = request_with_retry(
+            "GET",
+            f"{API_BASE}/{threads_post_id}/insights",
+            params={"metric": "views,likes", "access_token": THREADS_TOKEN},
+            timeout=API_TIMEOUT_SEC,
+        )
+        likes = 0
+        views = 0
+        for metric in r.json().get("data", []):
+            values = metric.get("values") or []
+            total = values[0].get("value", 0) if values else metric.get("total_value", {}).get("value", 0)
+            if metric.get("name") == "likes":
+                likes = total
+            elif metric.get("name") == "views":
+                views = total
+        return likes, views
+    except Exception as e:
+        log.warning(f"⚠️ Не удалось получить статистику {threads_post_id}: {e}")
+        return 0, 0
+
+
+def update_publication_stats(pub_id: str, likes: int, views: int):
+    try:
+        request_with_retry(
+            "PATCH",
+            f"{WORKSPACE_API_URL}/api/v1/publications/{pub_id}",
+            headers={"X-API-Key": WORKSPACE_API_KEY},
+            json={"likes": likes, "views": views, "stats_checked_at": datetime.now(tz=TZ).isoformat()},
+            timeout=API_TIMEOUT_SEC,
+        )
+    except Exception as e:
+        log.error(f"❌ Не удалось обновить статистику публикации {pub_id}: {e}")
+
+
+def check_engagement():
+    """Раз в день опрашивает лайки/охваты по всем публикациям за последние
+    STATS_WINDOW_DAYS дней — и для 'обычных' постов (на случай, что залетели),
+    и для 'стволов' (branch_count > 2), чтобы копить статистику для анализа."""
+    log.info("📊 Опрос статистики вовлечённости")
+
+    validate_config()
+    validate_threads_token()
+
+    since = datetime.now(tz=TZ) - timedelta(days=STATS_WINDOW_DAYS)
+    publications = load_recent_publications(since)
+    log.info(f"🔎 Публикаций для опроса: {len(publications)}")
+
+    checked = 0
+    for pub in publications:
+        pub_id = pub.get("id")
+        threads_ids = pub.get("threads_ids") or []
+        if not threads_ids:
+            continue
+        try:
+            # Для тредов из нескольких частей суммируем лайки/просмотры по всем частям.
+            total_likes = 0
+            total_views = 0
+            for tid in threads_ids:
+                likes, views = get_post_insights(tid)
+                total_likes += likes
+                total_views += views
+                time.sleep(1)
+            update_publication_stats(pub_id, total_likes, total_views)
+            checked += 1
+        except Exception as e:
+            log.exception(f"❌ Ошибка опроса публикации {str(pub_id)[:8]}...: {e}")
+
+    log.info(f"🏁 Готово. Проверено: {checked}")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 #  Главный цикл
 # ═════════════════════════════════════════════════════════════════════════════
 def run():
@@ -428,7 +527,7 @@ def run():
 
             threads_ids, pub_error = publish_parts(parts, media=media or None)
             if threads_ids:
-                mark_published(post_id)
+                mark_published(post_id, threads_ids)
                 log.info(f"✅ Пост {post_id[:8]}... опубликован")
                 published += 1
             else:
@@ -445,4 +544,4 @@ def run():
 
 
 if __name__ == "__main__":
-    run()
+    check_engagement() if "--stats" in sys.argv else run()

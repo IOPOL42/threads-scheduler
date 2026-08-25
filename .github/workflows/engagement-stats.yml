@@ -1,0 +1,36 @@
+name: Threads Engagement Stats
+
+on:
+  schedule:
+    - cron: '0 20 * * *'  # раз в день, 03:00 Asia/Ho_Chi_Minh
+  workflow_dispatch:        # ручной запуск из GitHub UI
+
+permissions:
+  contents: read
+
+concurrency:
+  group: engagement-stats
+  cancel-in-progress: false
+
+jobs:
+  stats:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Check engagement stats
+        env:
+          THREADS_USER_ID: ${{ secrets.THREADS_USER_ID }}
+          THREADS_TOKEN: ${{ secrets.THREADS_TOKEN }}
+          WORKSPACE_API_URL: ${{ secrets.WORKSPACE_API_URL }}
+          WORKSPACE_API_KEY: ${{ secrets.WORKSPACE_API_KEY }}
+        run: python scheduler.py --stats
