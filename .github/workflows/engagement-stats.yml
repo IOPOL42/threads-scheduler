@@ -2,7 +2,7 @@ name: Threads Engagement Stats
 
 on:
   schedule:
-    - cron: '0 20 * * *'  # раз в день, 03:00 Asia/Ho_Chi_Minh
+    - cron: '0 20 * * *'  # раз в день, 23:00 МСК — после закрытия вечернего окна
   workflow_dispatch:        # ручной запуск из GitHub UI
 
 permissions:
