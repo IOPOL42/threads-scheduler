@@ -245,11 +245,21 @@ def create_media_container(url: str) -> str | None:
 def create_container(
     text: str,
     reply_to_id: str = None,
-    media_urls: list[str] = None,
+    media_items: list[dict] = None,
 ) -> str | None:
+    """
+    `media_items` — [{"url": str, "spoiler": bool}, ...] для одной ветки.
+    is_spoiler_media задаётся один раз на контейнер (одиночное фото/видео) или
+    на карусель целиком — Threads не поддерживает пометку отдельных элементов
+    карусели по отдельности, поэтому если спойлер стоит хоть у одного вложения
+    в ветке, спойлером помечается вся карусель.
+    """
     plain_text, entities = parse_spoilers(text)
+    media_items = media_items or []
+    media_urls = [m["url"] for m in media_items]
+    is_spoiler_media = any(m.get("spoiler") for m in media_items)
 
-    if media_urls and len(media_urls) == 1:
+    if len(media_urls) == 1:
         url = media_urls[0]
         video = is_video_url(url)
         params = {
@@ -258,7 +268,9 @@ def create_container(
             "text": plain_text,
             "access_token": THREADS_TOKEN,
         }
-    elif media_urls and len(media_urls) > 1:
+        if is_spoiler_media:
+            params["is_spoiler_media"] = True
+    elif len(media_urls) > 1:
         child_ids = [create_media_container(u) for u in media_urls]
         if None in child_ids:
             log.error("❌ Не удалось создать один из медиа-контейнеров карусели")
@@ -271,6 +283,8 @@ def create_container(
             "text": plain_text,
             "access_token": THREADS_TOKEN,
         }
+        if is_spoiler_media:
+            params["is_spoiler_media"] = True
     else:
         params = {
             "media_type": "TEXT",
@@ -301,7 +315,7 @@ def create_container(
     )
     cid = r.json().get("id")
     # Для одиночного видео — ждём обработки перед публикацией
-    if cid and media_urls and len(media_urls) == 1 and is_video_url(media_urls[0]):
+    if cid and len(media_urls) == 1 and is_video_url(media_urls[0]):
         log.info(f"🎬 Видео-контейнер {cid} создан, жду обработки...")
         if not wait_for_container_ready(cid):
             return None
@@ -347,8 +361,9 @@ def publish_container(container_id: str) -> str | None:
 def publish_parts(parts: list[str], media: list[dict] = None) -> tuple[list[str] | None, str | None]:
     """
     Опубликовать одну или несколько частей ветки.
-    `media` — список {"url": str, "branch": int}, branch — номер ветки (1-indexed,
-    как в UI). Каждой части достаются только медиа с её собственным branch.
+    `media` — список {"url": str, "branch": int, "spoiler": bool}, branch — номер
+    ветки (1-indexed, как в UI). Каждой части достаются только медиа с её
+    собственным branch.
     Возвращает (thread_ids, error_message). error_message = None при успехе.
     """
     try:
@@ -356,8 +371,11 @@ def publish_parts(parts: list[str], media: list[dict] = None) -> tuple[list[str]
         prev_id = None
         for i, text in enumerate(parts):
             branch_no = i + 1
-            part_media = [m["url"] for m in (media or []) if m.get("branch") == branch_no] or None
-            container_id = create_container(text, reply_to_id=prev_id, media_urls=part_media)
+            part_media = [
+                {"url": m["url"], "spoiler": bool(m.get("spoiler"))}
+                for m in (media or []) if m.get("branch") == branch_no
+            ]
+            container_id = create_container(text, reply_to_id=prev_id, media_items=part_media)
             if not container_id:
                 return None, "Threads API не вернул ID контейнера"
             time.sleep(WAIT_BEFORE_PUBLISH)
