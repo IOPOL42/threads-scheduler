@@ -3,6 +3,7 @@ import re
 import sys
 import time
 import requests
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import logging
@@ -271,12 +272,17 @@ def create_container(
         if is_spoiler_media:
             params["is_spoiler_media"] = True
     elif len(media_urls) > 1:
-        child_ids = [create_media_container(u) for u in media_urls]
+        # Параллельно, а не по очереди: видео на стороне Threads обрабатывается
+        # долго (десятки секунд — единицы минут), и при последовательном создании
+        # первые карточки карусели успевают "протухнуть" за то время, пока
+        # дожидаемся обработки последних видео — Threads потом отвечает [24]
+        # "The requested resource does not exist" на попытке собрать карусель.
+        log.info(f"⏳ Создаём {len(media_urls)} медиаконтейнеров параллельно...")
+        with ThreadPoolExecutor(max_workers=len(media_urls)) as pool:
+            child_ids = list(pool.map(create_media_container, media_urls))
         if None in child_ids:
             log.error("❌ Не удалось создать один из медиа-контейнеров карусели")
             return None
-        log.info(f"⏳ Ожидаем готовности {len(child_ids)} медиаконтейнеров...")
-        time.sleep(8)
         params = {
             "media_type": "CAROUSEL",
             "children": ",".join(child_ids),
