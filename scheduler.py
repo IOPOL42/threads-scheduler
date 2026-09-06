@@ -320,9 +320,12 @@ def create_container(
         timeout=API_TIMEOUT_SEC,
     )
     cid = r.json().get("id")
-    # Для одиночного видео — ждём обработки перед публикацией
-    if cid and len(media_urls) == 1 and is_video_url(media_urls[0]):
-        log.info(f"🎬 Видео-контейнер {cid} создан, жду обработки...")
+    # Одиночное видео и любая карусель (даже из одних фото) требуют, чтобы Threads
+    # закончил сборку контейнера — иначе threads_publish отвечает "media ... cannot
+    # be found", хотя id только что был выдан при создании.
+    needs_wait = len(media_urls) > 1 or (len(media_urls) == 1 and is_video_url(media_urls[0]))
+    if cid and needs_wait:
+        log.info(f"🎬 Контейнер {cid} создан, жду готовности перед публикацией...")
         if not wait_for_container_ready(cid):
             return None
     return cid
