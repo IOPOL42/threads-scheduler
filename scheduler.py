@@ -397,10 +397,18 @@ def publish_parts(parts: list[str], media: list[dict] = None) -> tuple[list[str]
     except requests.HTTPError as e:
         try:
             err_data = e.response.json().get("error", {})
-            msg = err_data.get("message") or str(e)
+            msg = err_data.get("error_user_msg") or err_data.get("message") or str(e)
             code = err_data.get("code")
-            if code:
-                msg = f"[{code}] {msg}"
+            subcode = err_data.get("error_subcode")
+            # Путь без query string — там лежит access_token, его нельзя писать
+            # ни в publish_error (показывается пользователю в UI), ни в лог.
+            failed_path = e.response.url.split("?")[0] if e.response is not None else None
+            tag = f"{code}/{subcode}" if subcode else str(code) if code else None
+            if tag:
+                msg = f"[{tag}] {msg}"
+            if failed_path:
+                msg = f"{msg} ({failed_path})"
+            log.error(f"🔎 Полный ответ Threads: {e.response.text[:1000] if e.response is not None else 'n/a'}")
         except Exception:
             msg = str(e)
         log.error(f"❌ Ошибка публикации (HTTP): {msg}")
