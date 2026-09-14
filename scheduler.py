@@ -39,6 +39,12 @@ WAIT_BEFORE_PUBLISH = 3
 WAIT_BETWEEN_PARTS  = 2
 MAX_POST_LEN        = 500
 
+# Пауза между постами (не частями одного поста — см. WAIT_BETWEEN_PARTS выше)
+# внутри одного прогона. Если триггер долго не срабатывал (например, истёкший
+# токен на cron-job.org) и накопилось несколько просроченных постов, они не
+# должны выйти пачкой почти одновременно — это выглядит как спам в ленте.
+WAIT_BETWEEN_POSTS  = 45
+
 
 # ─── Retry ───────────────────────────────────────────────────────────────────
 RETRY_MAX_ATTEMPTS  = 5
@@ -527,6 +533,7 @@ def run():
 
     posts = load_ready_posts()
     published = 0
+    first_due = True
     for post in posts:
         post_id = post.get("id")
         try:
@@ -538,6 +545,11 @@ def run():
                 queued_at = queued_at.replace(tzinfo=TZ)
             if now < queued_at:
                 continue  # ещё рано
+
+            if not first_due:
+                log.info(f"⏳ Пауза {WAIT_BETWEEN_POSTS}с перед следующим постом (несколько просрочены разом)...")
+                time.sleep(WAIT_BETWEEN_POSTS)
+            first_due = False
 
             if not _SAFE_ID_RE.match(str(post_id)):
                 log.error(f"❌ Небезопасный post_id: {str(post_id)[:40]!r} — пропускаем")
