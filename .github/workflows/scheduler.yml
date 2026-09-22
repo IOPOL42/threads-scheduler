@@ -22,10 +22,10 @@ concurrency:
 jobs:
   publish:
     runs-on: ubuntu-latest
-    # Instagram обрабатывает видео у себя (до 3 минут на рилс), плюс пауза
-    # между постами — в прежние 10 минут запуск с несколькими рилсами уже
-    # не укладывается.
-    timeout-minutes: 20
+    # Instagram/TikTok обрабатывают видео у себя (до 3 минут на ролик), YouTube
+    # ролик скачивает и заливает сам публикатор, плюс пауза между постами —
+    # в прежние 10 минут запуск с несколькими видео уже не укладывается.
+    timeout-minutes: 25
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
@@ -43,4 +43,8 @@ jobs:
           THREADS_TOKEN: ${{ secrets.THREADS_TOKEN }}
           WORKSPACE_API_URL: ${{ secrets.WORKSPACE_API_URL }}
           WORKSPACE_API_KEY: ${{ secrets.WORKSPACE_API_KEY }}
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          TIKTOK_CLIENT_KEY: ${{ secrets.TIKTOK_CLIENT_KEY }}
+          TIKTOK_CLIENT_SECRET: ${{ secrets.TIKTOK_CLIENT_SECRET }}
         run: python scheduler.py

@@ -9,13 +9,21 @@ from zoneinfo import ZoneInfo
 import logging
 
 import instagram
+import youtube
+import tiktok
 
 _SAFE_ID_RE = re.compile(r'^[a-zA-Z0-9_\-]{1,128}$')
 
 # Порядок обхода площадок в одном запуске. Threads первым — он самый
-# быстрый и не зависит от внешнего токена в базе. YouTube и TikTok
-# появятся здесь, когда пройдут аудиты.
-PUBLISH_ORDER = ("threads", "instagram")
+# быстрый и не зависит от внешнего токена в базе. YouTube/TikTok уже
+# рабочие, но публикуются с ограничениями, пока не прошли аудит площадки
+# (см. youtube.py / tiktok.py) — это ограничение самих площадок, не наше.
+PUBLISH_ORDER = ("threads", "instagram", "youtube", "tiktok")
+
+GOOGLE_CLIENT_ID     = os.environ.get("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
+TIKTOK_CLIENT_KEY    = os.environ.get("TIKTOK_CLIENT_KEY", "")
+TIKTOK_CLIENT_SECRET = os.environ.get("TIKTOK_CLIENT_SECRET", "")
 
 # ─── Логирование ─────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -233,12 +241,15 @@ def load_social_token(platform: str) -> dict | None:
     return response.json().get("token")
 
 
-def store_social_token(platform: str, access_token: str, expires_at: str | None):
+def store_social_token(platform: str, access_token: str, expires_at: str | None, refresh_token: str | None = None):
+    body = {"platform": platform, "access_token": access_token, "expires_at": expires_at}
+    if refresh_token:
+        body["refresh_token"] = refresh_token
     request_with_retry(
         "PATCH",
         f"{WORKSPACE_API_URL}/api/v1/social-tokens",
         headers={"X-API-Key": WORKSPACE_API_KEY},
-        json={"platform": platform, "access_token": access_token, "expires_at": expires_at},
+        json=body,
         timeout=API_TIMEOUT_SEC,
     )
 
@@ -732,6 +743,139 @@ def instagram_account() -> tuple[str, str] | None:
     return account_id, new_token
 
 
+def publish_youtube_post(post: dict, channel_id: str, token: str) -> bool:
+    post_id = post["id"]
+    media = post.get("media") or []
+    video_url = next((m.get("url") for m in media if is_video_url(m.get("url") or "")), None)
+    if not video_url:
+        msg = "Для Shorts нужно видео, а в посте его нет"
+        log.warning(f"⚠️ YouTube: пост {post_id[:8]}... — {msg}")
+        report_failure(post_id, "youtube", msg)
+        return False
+
+    parts = parse_thread(post.get("content") or "")
+    full_text = "\n\n".join(parts)
+    # Заголовок — первая строка (YouTube режет длинные заголовки в интерфейсе),
+    # описание — весь текст, чтобы ничего не потерялось.
+    title = parts[0].split("\n")[0].strip() or "Reels"
+
+    log.info(f"🕐 YouTube: публикуем {post_id[:8]}...")
+    if not claim_platform(post_id, "youtube"):
+        return False
+
+    video_id, error = youtube.upload_short(token, video_url, title, full_text, log)
+    if video_id:
+        report_published(post_id, "youtube", [video_id])
+        log.info(f"✅ YouTube: Shorts {post_id[:8]}... опубликован")
+        return True
+
+    log.error(f"❌ YouTube: пост {post_id[:8]}...: {error}")
+    report_failure(post_id, "youtube", error or "ошибка публикации")
+    return False
+
+
+def publish_tiktok_post(post: dict, open_id: str, token: str) -> bool:
+    post_id = post["id"]
+    media = post.get("media") or []
+    video_url = next((m.get("url") for m in media if is_video_url(m.get("url") or "")), None)
+    if not video_url:
+        msg = "Для TikTok нужно видео, а в посте его нет"
+        log.warning(f"⚠️ TikTok: пост {post_id[:8]}... — {msg}")
+        report_failure(post_id, "tiktok", msg)
+        return False
+
+    caption = "\n\n".join(parse_thread(post.get("content") or ""))
+
+    log.info(f"🕐 TikTok: публикуем {post_id[:8]}...")
+    if not claim_platform(post_id, "tiktok"):
+        return False
+
+    publish_id, error = tiktok.publish_video(token, video_url, caption, log)
+    if publish_id:
+        report_published(post_id, "tiktok", [publish_id])
+        log.info(f"✅ TikTok: видео {post_id[:8]}... опубликовано")
+        return True
+
+    log.error(f"❌ TikTok: пост {post_id[:8]}...: {error}")
+    report_failure(post_id, "tiktok", error or "ошибка публикации")
+    return False
+
+
+def youtube_account() -> tuple[str, str] | None:
+    """(channel_id, access_token) либо None, если YouTube не подключён.
+
+    access_token у Google живёт всего час — обновляем его почти на каждый
+    запуск, а не когда истекает: дешевле одного лишнего запроса, зато без
+    гонки между "ещё жив" и "уже протух" на границе часа.
+    """
+    try:
+        stored = load_social_token("youtube")
+    except Exception as e:
+        log.error(f"❌ Не удалось получить токен YouTube: {e}")
+        return None
+    if not stored:
+        return None
+
+    channel_id = stored.get("account_id")
+    refresh = stored.get("refresh_token")
+    if not channel_id or not refresh:
+        log.error("❌ YouTube подключён не полностью: нет account_id или refresh_token")
+        return None
+    if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
+        log.error("❌ GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET не заданы — обновить токен YouTube нечем")
+        return None
+
+    new_token, expires_in, error = youtube.refresh_token(refresh, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET)
+    if error:
+        log.error(f"❌ {error}")
+        return None
+
+    new_expires = (datetime.now(tz=TZ) + timedelta(seconds=expires_in)).isoformat() if expires_in else None
+    try:
+        store_social_token("youtube", new_token, new_expires)
+    except Exception as e:
+        log.error(f"❌ Токен YouTube обновлён, но не сохранён: {e}")
+    return channel_id, new_token
+
+
+def tiktok_account() -> tuple[str, str] | None:
+    """(open_id, access_token) либо None, если TikTok не подключён.
+
+    access_token у TikTok живёт ~24 часа, но refresh_token каждый раз меняется —
+    в отличие от YouTube, здесь важно не потерять новый и записать его сразу.
+    """
+    try:
+        stored = load_social_token("tiktok")
+    except Exception as e:
+        log.error(f"❌ Не удалось получить токен TikTok: {e}")
+        return None
+    if not stored:
+        return None
+
+    open_id = stored.get("account_id")
+    refresh = stored.get("refresh_token")
+    if not open_id or not refresh:
+        log.error("❌ TikTok подключён не полностью: нет account_id или refresh_token")
+        return None
+    if not TIKTOK_CLIENT_KEY or not TIKTOK_CLIENT_SECRET:
+        log.error("❌ TIKTOK_CLIENT_KEY/TIKTOK_CLIENT_SECRET не заданы — обновить токен TikTok нечем")
+        return None
+
+    new_token, new_refresh, expires_in, error = tiktok.refresh_token(refresh, TIKTOK_CLIENT_KEY, TIKTOK_CLIENT_SECRET)
+    if error:
+        log.error(f"❌ {error}")
+        return None
+
+    new_expires = (datetime.now(tz=TZ) + timedelta(seconds=expires_in)).isoformat() if expires_in else None
+    try:
+        store_social_token("tiktok", new_token, new_expires, refresh_token=new_refresh)
+    except Exception as e:
+        # Не подстраховаться нельзя: старый refresh_token TikTok уже аннулировал.
+        log.error(f"❌ Токен TikTok обновлён, но не сохранён — следующий запуск не сможет обновиться: {e}")
+        return None
+    return open_id, new_token
+
+
 def run():
     log.info("🚀 Scheduler: запуск")
 
@@ -756,10 +900,10 @@ def run():
             continue
 
         account = None
-        if platform == "instagram":
-            account = instagram_account()
+        if platform in ("instagram", "youtube", "tiktok"):
+            account = {"instagram": instagram_account, "youtube": youtube_account, "tiktok": tiktok_account}[platform]()
             if not account:
-                log.info(f"ℹ️ Instagram не подключён — {len(posts)} постов ждут")
+                log.info(f"ℹ️ {platform} не подключён — {len(posts)} постов ждут")
                 continue
 
         for post in posts:
@@ -770,8 +914,12 @@ def run():
                     time.sleep(WAIT_BETWEEN_POSTS)
                 if platform == "threads":
                     ok = publish_threads_post(post)
-                else:
+                elif platform == "instagram":
                     ok = publish_instagram_post(post, account[0], account[1])
+                elif platform == "youtube":
+                    ok = publish_youtube_post(post, account[0], account[1])
+                else:
+                    ok = publish_tiktok_post(post, account[0], account[1])
                 if ok:
                     published += 1
                     paced = True
