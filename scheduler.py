@@ -8,7 +8,14 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import logging
 
+import instagram
+
 _SAFE_ID_RE = re.compile(r'^[a-zA-Z0-9_\-]{1,128}$')
+
+# Порядок обхода площадок в одном запуске. Threads первым — он самый
+# быстрый и не зависит от внешнего токена в базе. YouTube и TikTok
+# появятся здесь, когда пройдут аудиты.
+PUBLISH_ORDER = ("threads", "instagram")
 
 # ─── Логирование ─────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -114,12 +121,17 @@ def request_with_retry(method: str, url: str, **kwargs) -> requests.Response:
 # ═════════════════════════════════════════════════════════════════════════════
 #  Workspace API
 # ═════════════════════════════════════════════════════════════════════════════
-def load_ready_posts() -> list[dict]:
-    """Получить посты с queued_at (распределённые веб-приложением)."""
+def load_ready_posts(platform: str) -> list[dict]:
+    """Посты с queued_at, которым эта площадка ещё не закрыта.
+
+    Уже опубликованные на ней отсекает сервер — пост остаётся в ready,
+    пока не закрыты все его площадки, и без этого фильтра публикатор
+    брал бы один и тот же пост повторно.
+    """
     r = request_with_retry(
         "GET",
         f"{WORKSPACE_API_URL}/api/v1/posts",
-        params={"status": "ready", "platform": "threads"},
+        params={"status": "ready", "platform": platform},
         headers={"X-API-Key": WORKSPACE_API_KEY},
         timeout=API_TIMEOUT_SEC,
     )
@@ -143,24 +155,92 @@ def delete_published_posts(now: datetime):
         log.error(f"❌ Ошибка очистки опубликованных постов: {e}")
 
 
-def mark_published(post_id: str, threads_ids: list[str] = None):
-    """Пометить пост как опубликованный. threads_ids уходит в /api/v1/posts/:id,
-    который сам пробрасывает их в лог publications (нужно для опроса статистики)."""
+def claim_platform(post_id: str, platform: str) -> bool:
+    """Забрать слот (пост, площадка). False — слот уже занят или закрыт.
+
+    Замок на уровне площадки, а не поста: у одного поста их несколько, и
+    обнуление queued_at (как было раньше) спрятало бы пост от остальных
+    публикаторов.
+    """
+    # Do not retry an ambiguous claim: it may already have reached the server.
+    response = requests.patch(
+        f"{WORKSPACE_API_URL}/api/v1/posts/{post_id}",
+        headers={"X-API-Key": WORKSPACE_API_KEY},
+        json={"claim_platform": platform},
+        timeout=API_TIMEOUT_SEC,
+    )
+    if response.status_code == 409:
+        return False
+    response.raise_for_status()
+    return True
+
+
+def report_published(post_id: str, platform: str, external_ids: list[str] = None):
+    """Отчитаться об успешной публикации на площадке.
+
+    Пост уходит в архив и статус published только когда закрыта последняя
+    из выбранных площадок — это решает record_platform_publish на сервере.
+    """
     try:
         request_with_retry(
             "PATCH",
             f"{WORKSPACE_API_URL}/api/v1/posts/{post_id}",
             headers={"X-API-Key": WORKSPACE_API_KEY},
             json={
-                "status": "published",
+                "platform": platform,
                 "published_at": datetime.now(tz=TZ).isoformat(),
-                "queued_at": None,
-                "threads_ids": threads_ids or [],
+                "external_ids": external_ids or [],
             },
             timeout=API_TIMEOUT_SEC,
         )
     except Exception as e:
-        log.error(f"❌ Не удалось обновить статус поста {post_id}: {e}")
+        log.error(f"❌ Не удалось отметить {platform} у поста {post_id}: {e}")
+        raise
+
+
+def report_failure(post_id: str, platform: str, error: str):
+    """Пометить площадку упавшей и снять пост с очереди.
+
+    Слот остаётся повторяемым, но queued_at гасим: пост с ошибкой должен
+    ждать решения человека, а не перезапускаться каждые пять минут. Уже
+    закрытые площадки этого поста при повторной постановке в очередь
+    заново не публикуются — их слоты остались published.
+    """
+    try:
+        request_with_retry(
+            "PATCH",
+            f"{WORKSPACE_API_URL}/api/v1/posts/{post_id}",
+            headers={"X-API-Key": WORKSPACE_API_KEY},
+            json={"platform": platform, "publish_error": error[:500]},
+            timeout=API_TIMEOUT_SEC,
+        )
+    except Exception as e:
+        log.error(f"❌ Не удалось записать ошибку {platform} у поста {post_id}: {e}")
+    clear_queued(post_id)
+
+
+def load_social_token(platform: str) -> dict | None:
+    """Токен площадки из базы приложения. None — аккаунт не подключён."""
+    response = requests.get(
+        f"{WORKSPACE_API_URL}/api/v1/social-tokens",
+        params={"platform": platform},
+        headers={"X-API-Key": WORKSPACE_API_KEY},
+        timeout=API_TIMEOUT_SEC,
+    )
+    if response.status_code == 404:
+        return None
+    response.raise_for_status()
+    return response.json().get("token")
+
+
+def store_social_token(platform: str, access_token: str, expires_at: str | None):
+    request_with_retry(
+        "PATCH",
+        f"{WORKSPACE_API_URL}/api/v1/social-tokens",
+        headers={"X-API-Key": WORKSPACE_API_KEY},
+        json={"platform": platform, "access_token": access_token, "expires_at": expires_at},
+        timeout=API_TIMEOUT_SEC,
+    )
 
 
 def clear_queued(post_id: str, error: str | None = None):
@@ -518,8 +598,142 @@ def check_engagement():
 # ═════════════════════════════════════════════════════════════════════════════
 #  Главный цикл
 # ═════════════════════════════════════════════════════════════════════════════
+def due_posts(platform: str, now: datetime) -> list[dict]:
+    """Посты этой площадки, которым уже пора публиковаться."""
+    result = []
+    for post in load_ready_posts(platform):
+        post_id = str(post.get("id"))
+        queued_at_str = post.get("queued_at")
+        if not queued_at_str:
+            continue
+        queued_at = datetime.fromisoformat(queued_at_str.replace("Z", "+00:00"))
+        if queued_at.tzinfo is None:
+            queued_at = queued_at.replace(tzinfo=TZ)
+        if now < queued_at:
+            continue  # ещё рано
+        if not _SAFE_ID_RE.match(post_id):
+            log.error(f"❌ Небезопасный post_id: {post_id[:40]!r} — пропускаем")
+            continue
+        result.append(post)
+    return result
+
+
+def publish_threads_post(post: dict) -> bool:
+    post_id = post["id"]
+    parts = parse_thread(post.get("content") or "")
+    media = post.get("media") or []
+
+    too_long = [i + 1 for i, t in enumerate(parts) if len(t) > MAX_POST_LEN]
+    if too_long:
+        max_len = max(len(t) for t in parts)
+        msg = f"Слишком длинная часть {too_long} ({max_len} симв., максимум {MAX_POST_LEN})"
+        log.warning(f"⚠️ Пост {post_id[:8]}...: {msg} — пропускаем")
+        report_failure(post_id, "threads", msg)
+        return False
+
+    log.info(f"🕐 Threads: публикуем {post_id[:8]}... ({len(parts)} частей)")
+    # Слот забираем до обращения к API площадки: если упадём между
+    # успешной публикацией и отчётом, слот останется занятым, и повтор
+    # случится не раньше чем через 15 минут — время заметить дубль.
+    if not claim_platform(post_id, "threads"):
+        return False
+
+    threads_ids, pub_error = publish_parts(parts, media=media or None)
+    if threads_ids:
+        log.info("Threads IDs for %s: %s", post_id, threads_ids)
+        report_published(post_id, "threads", threads_ids)
+        log.info(f"✅ Threads: пост {post_id[:8]}... опубликован")
+        return True
+
+    log.error(f"❌ Threads: пост {post_id[:8]}...: {pub_error or 'ошибка публикации'}")
+    report_failure(post_id, "threads", pub_error or "ошибка публикации")
+    return False
+
+
+def publish_instagram_post(post: dict, account_id: str, token: str) -> bool:
+    post_id = post["id"]
+    media = post.get("media") or []
+    video_url = next((m.get("url") for m in media if is_video_url(m.get("url") or "")), None)
+    if not video_url:
+        msg = "Для рилса нужно видео, а в посте его нет"
+        log.warning(f"⚠️ Instagram: пост {post_id[:8]}... — {msg}")
+        report_failure(post_id, "instagram", msg)
+        return False
+
+    # Подпись — весь текст поста: ветки Threads склеиваем, чтобы ничего не
+    # потерялось, в рилсе они всё равно не имеют смысла по отдельности.
+    caption = "\n\n".join(parse_thread(post.get("content") or ""))
+
+    log.info(f"🕐 Instagram: публикуем {post_id[:8]}...")
+    if not claim_platform(post_id, "instagram"):
+        return False
+
+    media_id, error = instagram.publish_reel(account_id, token, video_url, caption, log)
+    if media_id:
+        report_published(post_id, "instagram", [media_id])
+        log.info(f"✅ Instagram: рилс {post_id[:8]}... опубликован")
+        return True
+
+    log.error(f"❌ Instagram: пост {post_id[:8]}...: {error}")
+    report_failure(post_id, "instagram", error or "ошибка публикации")
+    return False
+
+
+def instagram_account() -> tuple[str, str] | None:
+    """(account_id, токен) либо None, если Instagram не подключён.
+
+    Заодно продлевает токен, когда до истечения осталось немного: у
+    Instagram он живёт 60 дней, и продлевать его может только тот, кто
+    умеет записать новый — секрет workflow себя переписать не может.
+    """
+    try:
+        stored = load_social_token("instagram")
+    except Exception as e:
+        log.error(f"❌ Не удалось получить токен Instagram: {e}")
+        return None
+    if not stored:
+        return None
+
+    account_id = stored.get("account_id")
+    access_token = stored.get("access_token")
+    if not account_id or not access_token:
+        log.error("❌ Instagram подключён не полностью: нет account_id или токена")
+        return None
+
+    expires_at = stored.get("expires_at")
+    if not expires_at:
+        return account_id, access_token
+
+    try:
+        days_left = (datetime.fromisoformat(expires_at.replace("Z", "+00:00")) - datetime.now(tz=TZ)).days
+    except ValueError:
+        return account_id, access_token
+    if days_left > instagram.REFRESH_WHEN_DAYS_LEFT:
+        return account_id, access_token
+
+    new_token, expires_in, error = instagram.refresh_token(access_token)
+    if error:
+        # Не фатально: старый токен ещё жив, публикуем на нём.
+        log.error(f"❌ {error} (осталось {days_left} дн.)")
+        return account_id, access_token
+
+    new_expires = (
+        (datetime.now(tz=TZ) + timedelta(seconds=expires_in)).isoformat() if expires_in else None
+    )
+    try:
+        store_social_token("instagram", new_token, new_expires)
+    except Exception as e:
+        # Продлённый токен не сохранился — старый ещё валиден, работаем на
+        # нём и попробуем сохранить в следующий запуск.
+        log.error(f"❌ Токен Instagram продлён, но не сохранён: {e}")
+        return account_id, access_token
+
+    log.info(f"🔑 Токен Instagram продлён (оставалось {days_left} дн.)")
+    return account_id, new_token
+
+
 def run():
-    log.info("🚀 Threads Scheduler: запуск")
+    log.info("🚀 Scheduler: запуск")
 
     validate_config()
     validate_threads_token()
@@ -531,64 +745,42 @@ def run():
     if now.hour == 19:
         delete_published_posts(now)
 
-    posts = load_ready_posts()
     published = 0
-    first_due = True
-    for post in posts:
-        post_id = post.get("id")
-        try:
-            queued_at_str = post.get("queued_at")
-            if not queued_at_str:
-                continue
-            queued_at = datetime.fromisoformat(queued_at_str.replace("Z", "+00:00"))
-            if queued_at.tzinfo is None:
-                queued_at = queued_at.replace(tzinfo=TZ)
-            if now < queued_at:
-                continue  # ещё рано
+    # Пауза нужна только между реально ушедшими постами, чтобы после
+    # простоя триггера они не вышли пачкой почти одновременно.
+    paced = False
 
-            if not first_due:
-                log.info(f"⏳ Пауза {WAIT_BETWEEN_POSTS}с перед следующим постом (несколько просрочены разом)...")
-                time.sleep(WAIT_BETWEEN_POSTS)
-            first_due = False
+    for platform in PUBLISH_ORDER:
+        posts = due_posts(platform, now)
+        if not posts:
+            continue
 
-            if not _SAFE_ID_RE.match(str(post_id)):
-                log.error(f"❌ Небезопасный post_id: {str(post_id)[:40]!r} — пропускаем")
+        account = None
+        if platform == "instagram":
+            account = instagram_account()
+            if not account:
+                log.info(f"ℹ️ Instagram не подключён — {len(posts)} постов ждут")
                 continue
 
-            parts = parse_thread(post.get("content") or "")
-            media = post.get("media") or []
-
-            log.info(f"🕐 Публикуем {post_id[:8]}... ({len(parts)} частей, {queued_at.astimezone(TZ).strftime('%H:%M')})")
-
-            too_long = [i+1 for i, t in enumerate(parts) if len(t) > MAX_POST_LEN]
-            if too_long:
-                max_len = max(len(t) for t in parts)
-                msg = f"Слишком длинная часть {too_long} ({max_len} симв., максимум {MAX_POST_LEN})"
-                log.warning(f"⚠️ Пост {post_id[:8]}...: {msg} — пропускаем")
-                clear_queued(post_id, error=msg)
-                continue
-
-            # Claim the slot *before* calling the Threads API: if we crash or
-            # the network dies anywhere between a successful publish and the
-            # mark_published() call below, queued_at is already cleared here,
-            # so the next run's query (status=ready AND queued_at IS NOT NULL)
-            # will never pick this post up again and re-publish it.
-            clear_queued(post_id)
-
-            threads_ids, pub_error = publish_parts(parts, media=media or None)
-            if threads_ids:
-                mark_published(post_id, threads_ids)
-                log.info(f"✅ Пост {post_id[:8]}... опубликован")
-                published += 1
-            else:
-                log.error(f"❌ Пост {post_id[:8]}...: {pub_error or 'ошибка публикации'}")
-                clear_queued(post_id, error=pub_error)
-        except Exception as e:
-            log.exception(f"❌ Непредвиденная ошибка при обработке поста {str(post_id)[:8]}...: {e}")
+        for post in posts:
+            post_id = post.get("id")
             try:
-                clear_queued(post_id, error=str(e))
-            except Exception:
-                pass
+                if paced:
+                    log.info(f"⏳ Пауза {WAIT_BETWEEN_POSTS}с перед следующим постом...")
+                    time.sleep(WAIT_BETWEEN_POSTS)
+                if platform == "threads":
+                    ok = publish_threads_post(post)
+                else:
+                    ok = publish_instagram_post(post, account[0], account[1])
+                if ok:
+                    published += 1
+                    paced = True
+            except Exception as e:
+                log.exception(f"❌ Непредвиденная ошибка ({platform}, пост {str(post_id)[:8]}...): {e}")
+                try:
+                    report_failure(post_id, platform, f"Проверьте площадку перед повтором: {e}")
+                except Exception:
+                    pass
 
     log.info(f"🏁 Готово. Опубликовано: {published}")
 

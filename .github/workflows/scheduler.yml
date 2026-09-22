@@ -22,7 +22,10 @@ concurrency:
 jobs:
   publish:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Instagram обрабатывает видео у себя (до 3 минут на рилс), плюс пауза
+    # между постами — в прежние 10 минут запуск с несколькими рилсами уже
+    # не укладывается.
+    timeout-minutes: 20
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
