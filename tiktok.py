@@ -1,10 +1,10 @@
-"""Публикация видео в TikTok (Content Posting API, PULL_FROM_URL).
+"""Публикация видео в TikTok (Content Posting API, FILE_UPLOAD).
 
-PULL_FROM_URL требует, чтобы домен, откуда TikTok скачивает видео (у нас —
-домен Supabase Storage), был подтверждён в кабинете разработчика TikTok
-(см. инструкцию в settings/social). Без подтверждения init вернёт ошибку
-про unverified domain — тогда придётся переходить на загрузку байтов
-(FILE_UPLOAD), сейчас не реализовано за ненадобностью.
+Не PULL_FROM_URL: тот способ требует подтвердить домен, откуда TikTok
+скачивает видео, файлом в его корне или DNS-записью — а видео у нас лежит
+на общем домене Supabase (`*.supabase.co`), которым мы не владеем и не
+можем ни то, ни другое туда добавить. FILE_UPLOAD этого не требует —
+планировщик сам скачивает ролик и заливает его байтами, как и для YouTube.
 
 Пока приложение не прошло аудит на video.publish, TikTok сам не позволит
 опубликовать ролик как полностью публичный — доступные privacy_level
@@ -16,6 +16,8 @@ import requests
 
 API_BASE = "https://open.tiktokapis.com/v2"
 REQUEST_TIMEOUT_SEC = 30
+DOWNLOAD_TIMEOUT_SEC = 60
+UPLOAD_TIMEOUT_SEC = 300
 PUBLISH_TIMEOUT_SEC = 180
 PUBLISH_POLL_SEC = 5
 MAX_TITLE_LEN = 2200
@@ -52,13 +54,21 @@ def _creator_privacy_level(access_token: str) -> tuple[str | None, str | None]:
 
 
 def publish_video(access_token: str, video_url: str, caption: str, log) -> tuple[str | None, str | None]:
-    """Опубликовать видео. Возвращает (publish_id, None) либо (None, ошибка)."""
+    """Скачать видео по URL и опубликовать в TikTok. Возвращает (publish_id, None) либо (None, ошибка)."""
+    try:
+        video = requests.get(video_url, timeout=DOWNLOAD_TIMEOUT_SEC, stream=True)
+        video.raise_for_status()
+        video_bytes = video.content
+    except requests.RequestException as e:
+        return None, f"TikTok: не удалось скачать видео: {e}"
+
     privacy_level, error = _creator_privacy_level(access_token)
     if error:
         return None, error
     if privacy_level != "PUBLIC_TO_EVERYONE":
         log.warning(f"⚠️ TikTok: приложение ещё не прошло аудит — ролик уйдёт с privacy_level={privacy_level}")
 
+    video_size = len(video_bytes)
     try:
         init = requests.post(
             f"{API_BASE}/post/publish/video/init/",
@@ -72,8 +82,12 @@ def publish_video(access_token: str, video_url: str, caption: str, log) -> tuple
                     "disable_stitch": False,
                 },
                 "source_info": {
-                    "source": "PULL_FROM_URL",
-                    "video_url": video_url,
+                    # Один чанк на весь файл — реальный чанкинг (обязателен только
+                    # для файлов больше ~64 МБ) роликам такого размера не нужен.
+                    "source": "FILE_UPLOAD",
+                    "video_size": video_size,
+                    "chunk_size": video_size,
+                    "total_chunk_count": 1,
                 },
             },
             timeout=REQUEST_TIMEOUT_SEC,
@@ -83,9 +97,27 @@ def publish_video(access_token: str, video_url: str, caption: str, log) -> tuple
     if not init.ok:
         return None, f"TikTok: публикация не удалась — {_error_text(init)}"
 
-    publish_id = init.json().get("data", {}).get("publish_id")
-    if not publish_id:
-        return None, "TikTok: ответ без publish_id"
+    init_data = init.json().get("data", {})
+    publish_id = init_data.get("publish_id")
+    upload_url = init_data.get("upload_url")
+    if not publish_id or not upload_url:
+        return None, "TikTok: ответ без publish_id или upload_url"
+
+    try:
+        log.info(f"⏳ TikTok: заливаю {video_size // 1024} КБ...")
+        upload = requests.put(
+            upload_url,
+            data=video_bytes,
+            headers={
+                "Content-Type": "video/mp4",
+                "Content-Range": f"bytes 0-{video_size - 1}/{video_size}",
+            },
+            timeout=UPLOAD_TIMEOUT_SEC,
+        )
+    except requests.RequestException as e:
+        return None, f"TikTok: сеть недоступна при загрузке видео: {e}"
+    if not upload.ok:
+        return None, f"TikTok: загрузка не удалась — {_error_text(upload)}"
 
     deadline = time.monotonic() + PUBLISH_TIMEOUT_SEC
     while True:
