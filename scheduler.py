@@ -60,6 +60,14 @@ MAX_POST_LEN        = 500
 # должны выйти пачкой почти одновременно — это выглядит как спам в ленте.
 WAIT_BETWEEN_POSTS  = 45
 
+# Подстраховка от тихого зависания: если job падает по таймауту GitHub Actions
+# ровно во время публикации этого поста, report_failure не успевает
+# вызваться, слот освобождается по истечении аренды, и попытка тихо
+# повторяется каждый прогон. Раз в несколько часов — это уже не "подождать
+# ещё", а сломанная публикация, которую пора показать в UI, а не пытаться
+# бесконечно.
+STALE_QUEUE_HOURS  = 3
+
 
 # ─── Retry ───────────────────────────────────────────────────────────────────
 RETRY_MAX_ATTEMPTS  = 5
@@ -214,12 +222,16 @@ def report_failure(post_id: str, platform: str, error: str):
     закрытые площадки этого поста при повторной постановке в очередь
     заново не публикуются — их слоты остались published.
     """
+    # posts.publish_error — одно поле на пост, а площадок теперь четыре: без
+    # префикса ошибка одной площадки молча стирает уже показанную ошибку
+    # другой, и на доске не видно, к какой площадке она вообще относится.
+    tagged_error = f"[{platform}] {error}"[:500]
     try:
         request_with_retry(
             "PATCH",
             f"{WORKSPACE_API_URL}/api/v1/posts/{post_id}",
             headers={"X-API-Key": WORKSPACE_API_KEY},
-            json={"platform": platform, "publish_error": error[:500]},
+            json={"platform": platform, "publish_error": tagged_error},
             timeout=API_TIMEOUT_SEC,
         )
     except Exception as e:
@@ -908,6 +920,15 @@ def run():
 
         for post in posts:
             post_id = post.get("id")
+            queued_at_str = post.get("queued_at")
+            if queued_at_str:
+                queued_at = datetime.fromisoformat(queued_at_str.replace("Z", "+00:00"))
+                if queued_at.tzinfo is None:
+                    queued_at = queued_at.replace(tzinfo=TZ)
+                if now - queued_at > timedelta(hours=STALE_QUEUE_HOURS):
+                    log.error(f"❌ {platform}: пост {post_id[:8]}... висит в очереди дольше {STALE_QUEUE_HOURS}ч — снимаю")
+                    report_failure(post_id, platform, f"Публикация не завершилась за {STALE_QUEUE_HOURS}ч подряд — вероятно, зависает job, проверьте вручную")
+                    continue
             try:
                 if paced:
                     log.info(f"⏳ Пауза {WAIT_BETWEEN_POSTS}с перед следующим постом...")
