@@ -78,6 +78,7 @@ RETRY_BACKOFF       = 3
 # ─── Статистика вовлечённости ────────────────────────────────────────────────
 STATS_WINDOW_DAYS   = 10  # опрашивать публикации не старше N дней — лайки/охваты набираются за первые дни
 PERMALINK_BACKFILL_PER_RUN = 150  # ссылок на старые посты за один запуск статистики — укладываемся в таймаут job
+ENGAGEMENT_BACKFILL_PER_RUN = 80  # старых публикаций за запуск: по запросу и секунде паузы на каждую часть треда
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -546,28 +547,59 @@ def load_recent_publications(since: datetime) -> list[dict]:
     return r.json().get("publications", [])
 
 
-def get_post_insights(threads_post_id: str) -> tuple[int, int]:
-    """Лайки и просмотры одной публикации Threads. (0, 0) при ошибке."""
+def _safe_error(e: Exception) -> str:
+    """Текст ошибки без URL: в адресе запроса к Threads лежит access_token."""
+    if isinstance(e, requests.HTTPError) and e.response is not None:
+        return f"HTTP {e.response.status_code}"
+    return type(e).__name__
+
+
+ENGAGEMENT_METRICS = ("likes", "views", "replies", "reposts", "quotes", "shares")
+
+
+def _fetch_insights(threads_post_id: str, metrics: tuple[str, ...]) -> dict[str, int]:
+    r = request_with_retry(
+        "GET",
+        f"{API_BASE}/{threads_post_id}/insights",
+        params={"metric": ",".join(metrics), "access_token": THREADS_TOKEN},
+        timeout=API_TIMEOUT_SEC,
+    )
+    result = {m: 0 for m in metrics}
+    for metric in r.json().get("data", []):
+        values = metric.get("values") or []
+        total = values[0].get("value", 0) if values else metric.get("total_value", {}).get("value", 0)
+        if metric.get("name") in result:
+            result[metric["name"]] = int(total or 0)
+    return result
+
+
+def get_post_insights(threads_post_id: str) -> dict[str, int] | None:
+    """Лайки, просмотры, ответы, репосты, цитаты и «поделились» одной
+    публикации Threads. None при ошибке — тогда статистику не перезаписываем
+    нулями. Если API не знает метрику shares, повторяем без неё."""
     try:
-        r = request_with_retry(
-            "GET",
-            f"{API_BASE}/{threads_post_id}/insights",
-            params={"metric": "views,likes", "access_token": THREADS_TOKEN},
-            timeout=API_TIMEOUT_SEC,
-        )
-        likes = 0
-        views = 0
-        for metric in r.json().get("data", []):
-            values = metric.get("values") or []
-            total = values[0].get("value", 0) if values else metric.get("total_value", {}).get("value", 0)
-            if metric.get("name") == "likes":
-                likes = total
-            elif metric.get("name") == "views":
-                views = total
-        return likes, views
+        return _fetch_insights(threads_post_id, ENGAGEMENT_METRICS)
     except Exception as e:
-        log.warning(f"⚠️ Не удалось получить статистику {threads_post_id}: {e}")
-        return 0, 0
+        log.warning(f"⚠️ Статистика {threads_post_id} с shares не получена ({_safe_error(e)}), пробуем без неё")
+    try:
+        return _fetch_insights(threads_post_id, tuple(m for m in ENGAGEMENT_METRICS if m != "shares"))
+    except Exception as e:
+        log.warning(f"⚠️ Не удалось получить статистику {threads_post_id}: {_safe_error(e)}")
+        return None
+
+
+def collect_insights(threads_ids: list[str]) -> dict[str, int] | None:
+    """Сумма метрик по всем частям треда. None, если хоть одна часть не
+    ответила — неполную сумму не записываем."""
+    totals: dict[str, int] = {}
+    for tid in threads_ids:
+        stats = get_post_insights(tid)
+        if stats is None:
+            return None
+        for name, value in stats.items():
+            totals[name] = totals.get(name, 0) + value
+        time.sleep(1)
+    return totals
 
 
 def get_permalink(threads_post_id: str) -> str | None:
@@ -582,12 +614,12 @@ def get_permalink(threads_post_id: str) -> str | None:
         link = r.json().get("permalink")
         return link if isinstance(link, str) and link.startswith("https://") else None
     except Exception as e:
-        log.warning(f"⚠️ Не удалось получить ссылку {threads_post_id}: {e}")
+        log.warning(f"⚠️ Не удалось получить ссылку {threads_post_id}: {_safe_error(e)}")
         return None
 
 
-def update_publication_stats(pub_id: str, likes: int, views: int, permalink: str | None = None):
-    payload = {"likes": likes, "views": views, "stats_checked_at": datetime.now(tz=TZ).isoformat()}
+def update_publication_stats(pub_id: str, stats: dict[str, int], permalink: str | None = None):
+    payload: dict = {**stats, "stats_checked_at": datetime.now(tz=TZ).isoformat()}
     if permalink:
         payload["permalink"] = permalink
     try:
@@ -622,18 +654,14 @@ def check_engagement():
         if not threads_ids:
             continue
         try:
-            # Для тредов из нескольких частей суммируем лайки/просмотры по всем частям.
-            total_likes = 0
-            total_views = 0
-            for tid in threads_ids:
-                likes, views = get_post_insights(tid)
-                total_likes += likes
-                total_views += views
-                time.sleep(1)
+            # Для тредов из нескольких частей суммируем метрики по всем частям.
+            stats = collect_insights(threads_ids)
+            if stats is None:
+                continue
             # Ссылку на пост просим, только если Workspace её уже хранит (поле
             # есть в ответе) и она ещё не записана.
             permalink = get_permalink(threads_ids[0]) if "permalink" in pub and not pub.get("permalink") else None
-            update_publication_stats(pub_id, total_likes, total_views, permalink)
+            update_publication_stats(pub_id, stats, permalink)
             checked += 1
         except Exception as e:
             log.exception(f"❌ Ошибка опроса публикации {str(pub_id)[:8]}...: {e}")
@@ -641,6 +669,7 @@ def check_engagement():
     log.info(f"🏁 Готово. Проверено: {checked}")
 
     backfill_permalinks()
+    backfill_engagement()
 
 
 def backfill_permalinks():
@@ -684,6 +713,39 @@ def backfill_permalinks():
                 log.error(f"❌ Не удалось сохранить ссылку публикации {str(pub['id'])[:8]}...: {e}")
         time.sleep(1)
     log.info(f"🔗 Ссылок сохранено: {saved}")
+
+
+def backfill_engagement():
+    """Собирает ответы, репосты, цитаты и «поделились» для публикаций, где их
+    ещё нет (старый архив вне окна статистики) — порциями, чтобы уложиться в
+    таймаут запуска."""
+    try:
+        r = request_with_retry(
+            "GET",
+            f"{WORKSPACE_API_URL}/api/v1/publications",
+            params={"missing_engagement": "1"},
+            headers={"X-API-Key": WORKSPACE_API_KEY},
+            timeout=API_TIMEOUT_SEC,
+        )
+        publications = r.json().get("publications", [])
+    except Exception as e:
+        log.error(f"❌ Не удалось получить публикации без полной статистики: {e}")
+        return
+
+    # Версия Workspace без этих полей не отдаёт replies — тогда записывать некуда.
+    if not publications or "replies" not in publications[0]:
+        return
+
+    batch = [p for p in publications if p.get("replies") is None and p.get("threads_ids")][:ENGAGEMENT_BACKFILL_PER_RUN]
+    log.info(f"💬 Без полной статистики: {len(publications)}, собираем: {len(batch)}")
+    saved = 0
+    for pub in batch:
+        stats = collect_insights(pub["threads_ids"])
+        if stats is None:
+            continue
+        update_publication_stats(pub["id"], stats)
+        saved += 1
+    log.info(f"💬 Статистики сохранено: {saved}")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
