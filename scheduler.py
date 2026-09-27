@@ -77,6 +77,7 @@ RETRY_BACKOFF       = 3
 
 # ─── Статистика вовлечённости ────────────────────────────────────────────────
 STATS_WINDOW_DAYS   = 10  # опрашивать публикации не старше N дней — лайки/охваты набираются за первые дни
+PERMALINK_BACKFILL_PER_RUN = 150  # ссылок на старые посты за один запуск статистики — укладываемся в таймаут job
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -569,13 +570,32 @@ def get_post_insights(threads_post_id: str) -> tuple[int, int]:
         return 0, 0
 
 
-def update_publication_stats(pub_id: str, likes: int, views: int):
+def get_permalink(threads_post_id: str) -> str | None:
+    """Ссылка на пост в Threads (её выдаёт только API). None при ошибке."""
+    try:
+        r = request_with_retry(
+            "GET",
+            f"{API_BASE}/{threads_post_id}",
+            params={"fields": "permalink", "access_token": THREADS_TOKEN},
+            timeout=API_TIMEOUT_SEC,
+        )
+        link = r.json().get("permalink")
+        return link if isinstance(link, str) and link.startswith("https://") else None
+    except Exception as e:
+        log.warning(f"⚠️ Не удалось получить ссылку {threads_post_id}: {e}")
+        return None
+
+
+def update_publication_stats(pub_id: str, likes: int, views: int, permalink: str | None = None):
+    payload = {"likes": likes, "views": views, "stats_checked_at": datetime.now(tz=TZ).isoformat()}
+    if permalink:
+        payload["permalink"] = permalink
     try:
         request_with_retry(
             "PATCH",
             f"{WORKSPACE_API_URL}/api/v1/publications/{pub_id}",
             headers={"X-API-Key": WORKSPACE_API_KEY},
-            json={"likes": likes, "views": views, "stats_checked_at": datetime.now(tz=TZ).isoformat()},
+            json=payload,
             timeout=API_TIMEOUT_SEC,
         )
     except Exception as e:
@@ -610,12 +630,60 @@ def check_engagement():
                 total_likes += likes
                 total_views += views
                 time.sleep(1)
-            update_publication_stats(pub_id, total_likes, total_views)
+            # Ссылку на пост просим, только если Workspace её уже хранит (поле
+            # есть в ответе) и она ещё не записана.
+            permalink = get_permalink(threads_ids[0]) if "permalink" in pub and not pub.get("permalink") else None
+            update_publication_stats(pub_id, total_likes, total_views, permalink)
             checked += 1
         except Exception as e:
             log.exception(f"❌ Ошибка опроса публикации {str(pub_id)[:8]}...: {e}")
 
     log.info(f"🏁 Готово. Проверено: {checked}")
+
+    backfill_permalinks()
+
+
+def backfill_permalinks():
+    """Проставляет ссылки на посты в Threads публикациям архива, у которых их
+    ещё нет (в том числе старым, вне окна статистики) — порциями, чтобы
+    уложиться в таймаут запуска."""
+    try:
+        r = request_with_retry(
+            "GET",
+            f"{WORKSPACE_API_URL}/api/v1/publications",
+            params={"missing_permalink": "1"},
+            headers={"X-API-Key": WORKSPACE_API_KEY},
+            timeout=API_TIMEOUT_SEC,
+        )
+        publications = r.json().get("publications", [])
+    except Exception as e:
+        log.error(f"❌ Не удалось получить публикации без ссылок: {e}")
+        return
+
+    # Версия Workspace без поддержки ссылок не отдаёт поле permalink —
+    # тогда дозаполнять некуда.
+    if not publications or "permalink" not in publications[0]:
+        return
+
+    batch = [p for p in publications if not p.get("permalink") and p.get("threads_ids")][:PERMALINK_BACKFILL_PER_RUN]
+    log.info(f"🔗 Ссылок без записи: {len(publications)}, проставляем: {len(batch)}")
+    saved = 0
+    for pub in batch:
+        link = get_permalink(pub["threads_ids"][0])
+        if link:
+            try:
+                request_with_retry(
+                    "PATCH",
+                    f"{WORKSPACE_API_URL}/api/v1/publications/{pub['id']}",
+                    headers={"X-API-Key": WORKSPACE_API_KEY},
+                    json={"permalink": link},
+                    timeout=API_TIMEOUT_SEC,
+                )
+                saved += 1
+            except Exception as e:
+                log.error(f"❌ Не удалось сохранить ссылку публикации {str(pub['id'])[:8]}...: {e}")
+        time.sleep(1)
+    log.info(f"🔗 Ссылок сохранено: {saved}")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
