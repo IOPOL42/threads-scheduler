@@ -1,0 +1,31 @@
+name: Threads Replies Sync
+
+# Раз в 3 часа Workspace собирает новые комментарии под своими постами
+# (за последние 2 дня) — чтобы они копились и при выключенном ПК. Отбор и
+# варианты ответа делает помощник на ПК (Astra), отправляет — только Основатель.
+on:
+  schedule:
+    - cron: '15 */3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: replies-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Collect comments
+        env:
+          WORKSPACE_API_URL: ${{ secrets.WORKSPACE_API_URL }}
+          WORKSPACE_API_KEY: ${{ secrets.WORKSPACE_API_KEY }}
+        run: |
+          status=$(curl -sS -o response.json -w '%{http_code}' -X POST \
+            -H "X-API-Key: $WORKSPACE_API_KEY" "$WORKSPACE_API_URL/api/v1/replies/sync")
+          cat response.json; echo
+          test "$status" = "200"
