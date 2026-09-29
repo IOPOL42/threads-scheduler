@@ -746,6 +746,65 @@ def check_engagement():
     backfill_engagement()
 
 
+# ─── Снимки статистики свежих постов (залёты) ────────────────────────────────
+# Решение Основателя 30.09: первые 6 часов — раз в 30 минут, до 48 часов —
+# раз в 3 часа, дальше не снимаем. Запуск --snapshots — каждые 30 минут.
+SNAPSHOT_SCHEDULE = ((6 * 60, 30), (48 * 60, 180))  # (до возраста, мин; интервал, мин)
+SNAPSHOT_SLACK_MIN = 5  # cron GitHub Actions опаздывает — не пропускаем снимок из-за пары минут
+
+
+def snapshot_due(published_at: datetime, last_snapshot_at: datetime | None, now: datetime) -> bool:
+    age_min = (now - published_at).total_seconds() / 60
+    for until_min, every_min in SNAPSHOT_SCHEDULE:
+        if age_min < until_min:
+            if last_snapshot_at is None:
+                return True
+            return (now - last_snapshot_at).total_seconds() / 60 >= every_min - SNAPSHOT_SLACK_MIN
+    return False
+
+
+def _parse_time(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def take_snapshots():
+    """Снимки статистики публикаций младше 48 часов — по расписанию snapshot_due."""
+    log.info("📸 Снимки статистики свежих постов")
+    validate_config()
+    validate_threads_token()
+
+    now = datetime.now(tz=TZ)
+    publications = load_recent_publications(now - timedelta(hours=48))
+    taken = 0
+    for pub in publications:
+        published_at = _parse_time(pub.get("published_at"))
+        threads_ids = pub.get("threads_ids") or []
+        if not published_at or not threads_ids:
+            continue
+        if not snapshot_due(published_at, _parse_time(pub.get("last_snapshot_at")), now):
+            continue
+        try:
+            stats = collect_insights(threads_ids)
+            if stats is None:
+                continue
+            request_with_retry(
+                "POST",
+                f"{WORKSPACE_API_URL}/api/v1/publications/{pub['id']}/snapshots",
+                headers={"X-API-Key": WORKSPACE_API_KEY},
+                json=stats,
+                timeout=API_TIMEOUT_SEC,
+            )
+            taken += 1
+        except Exception as e:
+            log.error(f"❌ Снимок публикации {str(pub.get('id'))[:8]}... не сохранён: {_safe_error(e)}")
+    log.info(f"🏁 Снимков: {taken} (публикаций за 48 ч: {len(publications)})")
+
+
 def backfill_permalinks():
     """Проставляет ссылки на посты в Threads публикациям архива, у которых их
     ещё нет (в том числе старым, вне окна статистики) — порциями, чтобы
@@ -1159,4 +1218,9 @@ def run():
 
 
 if __name__ == "__main__":
-    check_engagement() if "--stats" in sys.argv else run()
+    if "--stats" in sys.argv:
+        check_engagement()
+    elif "--snapshots" in sys.argv:
+        take_snapshots()
+    else:
+        run()
