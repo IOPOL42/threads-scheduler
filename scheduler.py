@@ -35,6 +35,10 @@ log = logging.getLogger(__name__)
 
 
 # ─── Настройки из окружения ──────────────────────────────────────────────────
+# Токен Threads живёт в Workspace (social_tokens, platform=threads) и там же
+# продлевается — см. resolve_threads_credentials(). Секреты THREADS_USER_ID и
+# THREADS_TOKEN остались запасным вариантом на случай, если Workspace не
+# отдаёт токен.
 THREADS_USER_ID   = os.environ.get("THREADS_USER_ID", "")
 THREADS_TOKEN     = os.environ.get("THREADS_TOKEN", "")
 WORKSPACE_API_URL = os.environ.get("WORKSPACE_API_URL", "")
@@ -86,14 +90,84 @@ ENGAGEMENT_BACKFILL_PER_RUN = 80  # старых публикаций за за�
 # ═════════════════════════════════════════════════════════════════════════════
 def validate_config():
     missing = [v for v, val in [
-        ("THREADS_USER_ID",   THREADS_USER_ID),
-        ("THREADS_TOKEN",     THREADS_TOKEN),
         ("WORKSPACE_API_URL", WORKSPACE_API_URL),
         ("WORKSPACE_API_KEY", WORKSPACE_API_KEY),
     ] if not val]
     if missing:
         log.error(f"❌ Не заданы переменные окружения: {', '.join(missing)}")
         raise SystemExit(1)
+    resolve_threads_credentials()
+
+
+# Продлевать токен Threads, когда до конца осталось меньше стольких дней.
+# Long-lived токен живёт 60 дней; продление возможно не раньше, чем через
+# сутки после выдачи.
+THREADS_REFRESH_WHEN_DAYS_LEFT = 14
+
+
+def resolve_threads_credentials():
+    """Берёт ID аккаунта и токен Threads из Workspace и продлевает токен,
+    если он скоро истечёт. Не получилось — остаются секреты окружения."""
+    global THREADS_USER_ID, THREADS_TOKEN
+    try:
+        stored = load_social_token("threads")
+    except Exception as e:
+        stored = None
+        log.error(f"❌ Не удалось получить токен Threads из Workspace: {_safe_error(e)}")
+
+    if stored and stored.get("account_id") and stored.get("access_token"):
+        THREADS_USER_ID = stored["account_id"]
+        THREADS_TOKEN = stored["access_token"]
+        log.info("🔑 Токен Threads — из Workspace")
+        refresh_threads_token(stored)
+    elif THREADS_USER_ID and THREADS_TOKEN:
+        log.warning("⚠️ Токена Threads в Workspace нет — работаю на секретах окружения")
+    else:
+        log.error("❌ Нет токена Threads: ни в Workspace (Настройки → Соцсети), ни в секретах окружения")
+        raise SystemExit(1)
+
+
+def refresh_threads_token(stored: dict):
+    """Продлевает токен Threads и сохраняет новый в Workspace. Ошибка не
+    фатальна: старый токен ещё жив, работаем на нём."""
+    global THREADS_TOKEN
+    expires_at = stored.get("expires_at")
+    if not expires_at:
+        return
+    try:
+        days_left = (datetime.fromisoformat(expires_at.replace("Z", "+00:00")) - datetime.now(tz=TZ)).days
+    except ValueError:
+        return
+    if days_left > THREADS_REFRESH_WHEN_DAYS_LEFT:
+        return
+
+    try:
+        r = requests.get(
+            "https://graph.threads.net/refresh_access_token",
+            params={"grant_type": "th_refresh_token", "access_token": THREADS_TOKEN},
+            timeout=API_TIMEOUT_SEC,
+        )
+    except requests.RequestException as e:
+        log.error(f"❌ Threads: сеть недоступна при продлении токена: {_safe_error(e)}")
+        return
+    if not r.ok:
+        log.error(f"❌ Threads: продление токена не удалось ({r.status_code}), осталось {days_left} дн.")
+        return
+
+    payload = r.json()
+    new_token = payload.get("access_token")
+    if not new_token:
+        log.error("❌ Threads: продление вернуло ответ без токена")
+        return
+    expires_in = payload.get("expires_in")
+    new_expires = (datetime.now(tz=TZ) + timedelta(seconds=expires_in)).isoformat() if expires_in else None
+    try:
+        store_social_token("threads", new_token, new_expires)
+    except Exception as e:
+        log.error(f"❌ Токен Threads продлён, но не сохранён: {_safe_error(e)}")
+        return
+    THREADS_TOKEN = new_token
+    log.info(f"🔑 Токен Threads продлён (оставалось {days_left} дн.)")
 
 
 def validate_threads_token():
