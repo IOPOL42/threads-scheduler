@@ -26,12 +26,47 @@ TIKTOK_CLIENT_KEY    = os.environ.get("TIKTOK_CLIENT_KEY", "")
 TIKTOK_CLIENT_SECRET = os.environ.get("TIKTOK_CLIENT_SECRET", "")
 
 # ─── Логирование ─────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler()]
-)
+# Репозиторий публичный — логи Actions видны всем. Токены площадок приходят
+# из Workspace, а не из секретов GitHub, поэтому GitHub их сам не прячет:
+# каждый полученный токен регистрируем (add_secret) — он маскируется и в
+# логе Actions (::add-mask::), и в любом нашем сообщении, а access_token в
+# адресах запросов (тексты ошибок requests) вырезается фильтром.
+_SECRETS: set[str] = set()
+_TOKEN_IN_URL = re.compile(r"(access_token=)[^&\s'\"]+")
+
+
+def redact(text: str) -> str:
+    text = _TOKEN_IN_URL.sub(r"\1***", str(text))
+    for secret in _SECRETS:
+        text = text.replace(secret, "***")
+    return text
+
+
+def add_secret(value: str | None):
+    if not value or len(value) < 8 or value in _SECRETS:
+        return
+    _SECRETS.add(value)
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        print(f"::add-mask::{value}", flush=True)
+
+
+class _RedactFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        record.msg = redact(message)
+        record.args = ()
+        if record.exc_info:
+            record.exc_text = redact(logging.Formatter().formatException(record.exc_info))
+            record.exc_info = None
+        return True
+
+
+_handler = logging.StreamHandler()
+_handler.addFilter(_RedactFilter())
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', handlers=[_handler])
 log = logging.getLogger(__name__)
+# Фильтр и на самом логгере: записи режутся до любого обработчика.
+log.addFilter(_RedactFilter())
 
 
 # ─── Настройки из окружения ──────────────────────────────────────────────────
@@ -43,11 +78,15 @@ THREADS_USER_ID   = os.environ.get("THREADS_USER_ID", "")
 THREADS_TOKEN     = os.environ.get("THREADS_TOKEN", "")
 WORKSPACE_API_URL = os.environ.get("WORKSPACE_API_URL", "")
 WORKSPACE_API_KEY = os.environ.get("WORKSPACE_API_KEY", "")
+# Запасной токен из секретов GitHub — если токен из Workspace отозван.
+FALLBACK_THREADS = (THREADS_USER_ID, THREADS_TOKEN)
+for _secret in (THREADS_TOKEN, WORKSPACE_API_KEY, os.environ.get("GOOGLE_CLIENT_SECRET"), os.environ.get("TIKTOK_CLIENT_SECRET")):
+    add_secret(_secret)
 
 
 # ─── Timezone ────────────────────────────────────────────────────────────────
-# Публикация идёт по окну 07:30–20:00 МСК (см. kanban-board.tsx) — используем
-# ту же зону здесь, чтобы дневная очистка/статистика были на неё завязаны.
+# Окна публикации — по МСК (см. lib/content-scheduling.ts) — та же зона здесь,
+# чтобы дневная очистка была на неё завязана.
 TZ = ZoneInfo("Europe/Moscow")
 
 
@@ -64,12 +103,9 @@ MAX_POST_LEN        = 500
 # должны выйти пачкой почти одновременно — это выглядит как спам в ленте.
 WAIT_BETWEEN_POSTS  = 45
 
-# Подстраховка от тихого зависания: если job падает по таймауту GitHub Actions
-# ровно во время публикации этого поста, report_failure не успевает
-# вызваться, слот освобождается по истечении аренды, и попытка тихо
-# повторяется каждый прогон. Раз в несколько часов — это уже не "подождать
-# ещё", а сломанная публикация, которую пора показать в UI, а не пытаться
-# бесконечно.
+# Пост, чьё время прошло больше чем STALE_QUEUE_HOURS назад, не публикуем
+# молча с опозданием: запуски могли не идти (триггер, GitHub) — решает
+# Основатель, пост уходит в ошибку с понятной причиной.
 STALE_QUEUE_HOURS  = 3
 
 
@@ -79,10 +115,6 @@ RETRY_BASE_DELAY    = 5
 RETRY_BACKOFF       = 3
 
 
-# ─── Статистика вовлечённости ────────────────────────────────────────────────
-STATS_WINDOW_DAYS   = 10  # опрашивать публикации не старше N дней — лайки/охваты набираются за первые дни
-PERMALINK_BACKFILL_PER_RUN = 150  # ссылок на старые посты за один запуск статистики — укладываемся в таймаут job
-ENGAGEMENT_BACKFILL_PER_RUN = 80  # старых публикаций за запуск: по запросу и секунде паузы на каждую часть треда
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -118,6 +150,7 @@ def resolve_threads_credentials():
     if stored and stored.get("account_id") and stored.get("access_token"):
         THREADS_USER_ID = stored["account_id"]
         THREADS_TOKEN = stored["access_token"]
+        add_secret(THREADS_TOKEN)
         log.info("🔑 Токен Threads — из Workspace")
         refresh_threads_token(stored)
     elif THREADS_USER_ID and THREADS_TOKEN:
@@ -159,6 +192,7 @@ def refresh_threads_token(stored: dict):
     if not new_token:
         log.error("❌ Threads: продление вернуло ответ без токена")
         return
+    add_secret(new_token)
     expires_in = payload.get("expires_in")
     new_expires = (datetime.now(tz=TZ) + timedelta(seconds=expires_in)).isoformat() if expires_in else None
     try:
@@ -167,47 +201,88 @@ def refresh_threads_token(stored: dict):
         log.error(f"❌ Токен Threads продлён, но не сохранён: {_safe_error(e)}")
         return
     THREADS_TOKEN = new_token
+    add_secret(new_token)
     log.info(f"🔑 Токен Threads продлён (оставалось {days_left} дн.)")
 
 
-def validate_threads_token():
-    log.info("🔑 Проверяю токен Threads...")
-    r = requests.get(
-        f"{API_BASE}/me",
-        params={"access_token": THREADS_TOKEN, "fields": "id,username"},
-        timeout=API_TIMEOUT_SEC,
-    )
+def _check_token(token: str) -> tuple[bool, str]:
+    """(жив ли токен, причина). Сетевой сбой и 5xx — повтор, а не «невалиден»."""
+    try:
+        r = request_with_retry("GET", f"{API_BASE}/me", params={"access_token": token, "fields": "id,username"},
+                               timeout=API_TIMEOUT_SEC, raise_for_status=False)
+    except Exception as e:
+        return False, f"Threads недоступен: {_safe_error(e)}"
     if r.status_code == 200:
         data = r.json()
-        log.info(f"✅ Threads токен валиден. Аккаунт: @{data.get('username')} (id={data.get('id')})")
-    else:
-        log.error(f"❌ Threads токен невалиден ({r.status_code}): {r.text[:200]}")
-        raise SystemExit(1)
+        log.info(f"✅ Threads токен валиден. Аккаунт: @{data.get('username')}")
+        return True, ""
+    try:
+        err = r.json().get("error", {})
+    except ValueError:
+        err = {}
+    if err.get("code") == 190:
+        return False, "Токен Threads истёк или отозван — вставьте новый в Workspace: Настройки → Соцсети"
+    return False, f"Threads отклонил токен (HTTP {r.status_code})"
+
+
+def validate_threads_token() -> str | None:
+    """None — токен рабочий; иначе причина. Токен из Workspace отозван —
+    пробуем запасной из секретов GitHub."""
+    global THREADS_USER_ID, THREADS_TOKEN
+    log.info("🔑 Проверяю токен Threads...")
+    ok, reason = _check_token(THREADS_TOKEN)
+    if ok:
+        return None
+    fallback_id, fallback_token = FALLBACK_THREADS
+    if fallback_token and fallback_token != THREADS_TOKEN:
+        log.warning(f"⚠️ {reason} — пробую запасной токен из секретов")
+        if _check_token(fallback_token)[0]:
+            THREADS_USER_ID, THREADS_TOKEN = fallback_id, fallback_token
+            return None
+    log.error(f"❌ {reason}")
+    return reason
+
+
+def _safe_error(e: Exception) -> str:
+    """Текст ошибки без URL: в адресе запроса к Threads лежит access_token."""
+    if isinstance(e, requests.HTTPError) and e.response is not None:
+        return f"HTTP {e.response.status_code}"
+    if isinstance(e, (requests.RequestException, OSError)):
+        return type(e).__name__
+    return redact(str(e))[:300] or type(e).__name__
 
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  HTTP с retry
 # ═════════════════════════════════════════════════════════════════════════════
-def request_with_retry(method: str, url: str, **kwargs) -> requests.Response:
+def request_with_retry(method: str, url: str, attempts: int = RETRY_MAX_ATTEMPTS, raise_for_status: bool = True, **kwargs) -> requests.Response:
+    """Только для идемпотентных запросов: чтение, отчёты в Workspace (сервер
+    не задвоит), создание контейнера. Публикацию (threads_publish) так не
+    повторять — см. publish_container."""
     last_exc = None
-    for attempt in range(1, RETRY_MAX_ATTEMPTS + 1):
+    for attempt in range(1, attempts + 1):
         try:
             r = requests.request(method, url, **kwargs)
             if r.status_code == 429 or 500 <= r.status_code < 600:
+                if attempt == attempts:
+                    break
                 delay = RETRY_BASE_DELAY * (RETRY_BACKOFF ** (attempt - 1))
-                log.warning(f"⏳ HTTP {r.status_code} (попытка {attempt}/{RETRY_MAX_ATTEMPTS}). Жду {delay}с...")
+                log.warning(f"⏳ HTTP {r.status_code} (попытка {attempt}/{attempts}). Жду {delay}с...")
                 time.sleep(delay)
                 continue
-            r.raise_for_status()
+            if raise_for_status:
+                r.raise_for_status()
             return r
         except (requests.ConnectionError, requests.Timeout) as e:
             last_exc = e
+            if attempt == attempts:
+                break
             delay = RETRY_BASE_DELAY * (RETRY_BACKOFF ** (attempt - 1))
-            log.warning(f"⏳ Сетевая ошибка: {e} (попытка {attempt}/{RETRY_MAX_ATTEMPTS}). Жду {delay}с...")
+            log.warning(f"⏳ Сетевая ошибка: {_safe_error(e)} (попытка {attempt}/{attempts}). Жду {delay}с...")
             time.sleep(delay)
     if last_exc:
         raise last_exc
-    raise RuntimeError(f"API недоступен после {RETRY_MAX_ATTEMPTS} попыток")
+    raise RuntimeError(f"API недоступен после {attempts} попыток")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -223,7 +298,7 @@ def load_ready_posts(platform: str) -> list[dict]:
     r = request_with_retry(
         "GET",
         f"{WORKSPACE_API_URL}/api/v1/posts",
-        params={"status": "ready", "platform": platform},
+        params={"status": "ready", "platform": platform, "due_before": (datetime.now(tz=TZ) + timedelta(minutes=1)).isoformat()},
         headers={"X-API-Key": WORKSPACE_API_KEY},
         timeout=API_TIMEOUT_SEC,
     )
@@ -274,9 +349,12 @@ def report_published(post_id: str, platform: str, external_ids: list[str] = None
     из выбранных площадок — это решает record_platform_publish на сервере.
     """
     try:
+        # Сервер не задвоит повторный отчёт. Бюджет повторов ~1 минута: дальше
+        # слот остаётся publishing и через 15 минут уйдёт в «проверьте Threads».
         request_with_retry(
             "PATCH",
             f"{WORKSPACE_API_URL}/api/v1/posts/{post_id}",
+            attempts=3,
             headers={"X-API-Key": WORKSPACE_API_KEY},
             json={
                 "platform": platform,
@@ -290,7 +368,7 @@ def report_published(post_id: str, platform: str, external_ids: list[str] = None
         raise
 
 
-def report_failure(post_id: str, platform: str, error: str):
+def report_failure(post_id: str, platform: str, error: str, external_ids: list[str] | None = None):
     """Пометить площадку упавшей и снять пост с очереди.
 
     Слот остаётся повторяемым, но queued_at гасим: пост с ошибкой должен
@@ -301,18 +379,22 @@ def report_failure(post_id: str, platform: str, error: str):
     # posts.publish_error — одно поле на пост, а площадок теперь четыре: без
     # префикса ошибка одной площадки молча стирает уже показанную ошибку
     # другой, и на доске не видно, к какой площадке она вообще относится.
-    tagged_error = f"[{platform}] {error}"[:500]
+    # external_ids — уже вышедшие части ветки: повтор продолжит с них, а не
+    # опубликует ветку заново с первой части. Сервер снимает пост с очереди
+    # в той же транзакции (record_platform_failure).
+    tagged_error = redact(f"[{platform}] {error}")[:500]
     try:
         request_with_retry(
             "PATCH",
             f"{WORKSPACE_API_URL}/api/v1/posts/{post_id}",
+            attempts=3,
             headers={"X-API-Key": WORKSPACE_API_KEY},
-            json={"platform": platform, "publish_error": tagged_error},
+            json={"platform": platform, "publish_error": tagged_error, **({"external_ids": external_ids} if external_ids else {})},
             timeout=API_TIMEOUT_SEC,
         )
     except Exception as e:
-        log.error(f"❌ Не удалось записать ошибку {platform} у поста {post_id}: {e}")
-    clear_queued(post_id)
+        log.error(f"❌ Не удалось записать ошибку {platform} у поста {post_id}: {_safe_error(e)}")
+        clear_queued(post_id, tagged_error)
 
 
 def load_social_token(platform: str) -> dict | None:
@@ -346,7 +428,7 @@ def clear_queued(post_id: str, error: str | None = None):
     """Сбросить queued_at у поста при ошибке публикации. Записывает причину ошибки."""
     payload: dict = {"queued_at": None}
     if error:
-        payload["publish_error"] = error[:500]
+        payload["publish_error"] = redact(error)[:500]
     try:
         request_with_retry(
             "PATCH",
@@ -356,7 +438,7 @@ def clear_queued(post_id: str, error: str | None = None):
             timeout=API_TIMEOUT_SEC,
         )
     except Exception as e:
-        log.error(f"❌ Не удалось сбросить queued_at у {post_id}: {e}")
+        log.error(f"❌ Не удалось сбросить queued_at у {post_id}: {_safe_error(e)}")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -508,7 +590,7 @@ def create_container(
     # Одиночное видео и любая карусель (даже из одних фото) требуют, чтобы Threads
     # закончил сборку контейнера — иначе threads_publish отвечает "media ... cannot
     # be found", хотя id только что был выдан при создании.
-    needs_wait = len(media_urls) > 1 or (len(media_urls) == 1 and is_video_url(media_urls[0]))
+    needs_wait = len(media_urls) > 0
     if cid and needs_wait:
         log.info(f"🎬 Контейнер {cid} создан, жду готовности перед публикацией...")
         if not wait_for_container_ready(cid):
@@ -536,34 +618,65 @@ def wait_for_container_ready(container_id: str, timeout_sec: int = 180, poll_sec
                 log.error(f"❌ Контейнер {container_id}: {status} — {data.get('error_message', '')}")
                 return False
         except Exception as e:
-            log.warning(f"⚠️ Опрос статуса контейнера: {e}")
+            log.warning(f"⚠️ Опрос статуса контейнера: {_safe_error(e)}")
         time.sleep(poll_sec)
     log.error(f"❌ Контейнер {container_id} не готов за {timeout_sec}с")
     return False
 
 
+class AmbiguousPublish(Exception):
+    """Ответ на публикацию потерялся: пост мог выйти. Повторять нельзя —
+    сначала проверить Threads."""
+
+
+def _not_ready(response: requests.Response) -> bool:
+    try:
+        err = response.json().get("error", {})
+    except ValueError:
+        return False
+    return err.get("code") == 24 or err.get("error_subcode") == 4279009 or "not ready" in str(err.get("message", "")).lower()
+
+
 def publish_container(container_id: str) -> str | None:
-    r = request_with_retry(
-        "POST",
-        f"{API_BASE}/{THREADS_USER_ID}/threads_publish",
-        params={"creation_id": container_id, "access_token": THREADS_TOKEN},
-        timeout=API_TIMEOUT_SEC,
-    )
-    return r.json().get("id")
+    """threads_publish повторяем только на «контейнер ещё не готов»: при
+    таймауте или 5xx пост мог уже выйти, и повтор опубликовал бы его дважды."""
+    for attempt in range(4):
+        try:
+            r = requests.post(
+                f"{API_BASE}/{THREADS_USER_ID}/threads_publish",
+                params={"creation_id": container_id, "access_token": THREADS_TOKEN},
+                timeout=60,
+            )
+        except (requests.ConnectionError, requests.Timeout) as e:
+            raise AmbiguousPublish(f"ответ Threads потерялся ({_safe_error(e)})")
+        if r.status_code >= 500:
+            raise AmbiguousPublish(f"Threads ответил {r.status_code} на публикацию")
+        if r.status_code == 400 and _not_ready(r) and attempt < 3:
+            log.info(f"⏳ Контейнер {container_id} ещё не готов — жду {5 * (attempt + 1)}с")
+            time.sleep(5 * (attempt + 1))
+            continue
+        r.raise_for_status()
+        return r.json().get("id")
+    return None
 
 
-def publish_parts(parts: list[str], media: list[dict] = None) -> tuple[list[str] | None, str | None]:
+def publish_parts(parts: list[str], media: list[dict] = None, done_ids: list[str] | None = None) -> tuple[list[str], str | None]:
     """
     Опубликовать одну или несколько частей ветки.
     `media` — список {"url": str, "branch": int, "spoiler": bool}, branch — номер
     ветки (1-indexed, как в UI). Каждой части достаются только медиа с её
     собственным branch.
-    Возвращает (thread_ids, error_message). error_message = None при успехе.
+    `done_ids` — части, уже вышедшие в прошлой попытке: продолжаем после них
+    (ответом на последнюю), а не публикуем ветку заново.
+    Возвращает (thread_ids, error_message): при ошибке thread_ids — те части,
+    что всё-таки вышли; error_message = None при успехе.
     """
+    post_ids = list(done_ids or [])
     try:
-        post_ids = []
-        prev_id = None
+        prev_id = post_ids[-1] if post_ids else None
         for i, text in enumerate(parts):
+            if i < len(post_ids):
+                continue
             branch_no = i + 1
             part_media = [
                 {"url": m["url"], "spoiler": bool(m.get("spoiler"))}
@@ -571,17 +684,21 @@ def publish_parts(parts: list[str], media: list[dict] = None) -> tuple[list[str]
             ]
             container_id = create_container(text, reply_to_id=prev_id, media_items=part_media)
             if not container_id:
-                return None, "Threads API не вернул ID контейнера"
+                return post_ids, "Threads API не вернул ID контейнера"
             time.sleep(WAIT_BEFORE_PUBLISH)
             post_id = publish_container(container_id)
             if not post_id:
-                return None, "Threads API не вернул ID публикации"
+                return post_ids, "Threads API не вернул ID публикации"
             log.info(f"✅ Часть {i+1}/{len(parts)} опубликована! ID: {post_id}")
             post_ids.append(post_id)
             prev_id = post_id
             if i < len(parts) - 1:
                 time.sleep(WAIT_BETWEEN_PARTS)
         return post_ids, None
+    except AmbiguousPublish as e:
+        msg = f"Проверьте Threads, прежде чем повторять: {e}"
+        log.error(f"❌ {msg}")
+        return post_ids, msg
     except requests.HTTPError as e:
         try:
             err_data = e.response.json().get("error", {})
@@ -598,287 +715,12 @@ def publish_parts(parts: list[str], media: list[dict] = None) -> tuple[list[str]
                 msg = f"{msg} ({failed_path})"
             log.error(f"🔎 Полный ответ Threads: {e.response.text[:1000] if e.response is not None else 'n/a'}")
         except Exception:
-            msg = str(e)
+            msg = _safe_error(e)
         log.error(f"❌ Ошибка публикации (HTTP): {msg}")
-        return None, msg
+        return post_ids, redact(msg)
     except (requests.RequestException, RuntimeError) as e:
-        log.error(f"❌ Ошибка публикации: {e}")
-        return None, str(e)
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  Статистика вовлечённости (архив "залетевших" постов и "стволов")
-# ═════════════════════════════════════════════════════════════════════════════
-def load_recent_publications(since: datetime) -> list[dict]:
-    """Публикации за последние STATS_WINDOW_DAYS дней, у которых есть Threads ID."""
-    r = request_with_retry(
-        "GET",
-        f"{WORKSPACE_API_URL}/api/v1/publications",
-        params={"since": since.isoformat()},
-        headers={"X-API-Key": WORKSPACE_API_KEY},
-        timeout=API_TIMEOUT_SEC,
-    )
-    return r.json().get("publications", [])
-
-
-def _safe_error(e: Exception) -> str:
-    """Текст ошибки без URL: в адресе запроса к Threads лежит access_token."""
-    if isinstance(e, requests.HTTPError) and e.response is not None:
-        return f"HTTP {e.response.status_code}"
-    return type(e).__name__
-
-
-ENGAGEMENT_METRICS = ("likes", "views", "replies", "reposts", "quotes", "shares")
-
-
-def _fetch_insights(threads_post_id: str, metrics: tuple[str, ...]) -> dict[str, int]:
-    r = request_with_retry(
-        "GET",
-        f"{API_BASE}/{threads_post_id}/insights",
-        params={"metric": ",".join(metrics), "access_token": THREADS_TOKEN},
-        timeout=API_TIMEOUT_SEC,
-    )
-    result = {m: 0 for m in metrics}
-    for metric in r.json().get("data", []):
-        values = metric.get("values") or []
-        total = values[0].get("value", 0) if values else metric.get("total_value", {}).get("value", 0)
-        if metric.get("name") in result:
-            result[metric["name"]] = int(total or 0)
-    return result
-
-
-def get_post_insights(threads_post_id: str) -> dict[str, int] | None:
-    """Лайки, просмотры, ответы, репосты, цитаты и «поделились» одной
-    публикации Threads. None при ошибке — тогда статистику не перезаписываем
-    нулями. Если API не знает метрику shares, повторяем без неё."""
-    try:
-        return _fetch_insights(threads_post_id, ENGAGEMENT_METRICS)
-    except Exception as e:
-        log.warning(f"⚠️ Статистика {threads_post_id} с shares не получена ({_safe_error(e)}), пробуем без неё")
-    try:
-        return _fetch_insights(threads_post_id, tuple(m for m in ENGAGEMENT_METRICS if m != "shares"))
-    except Exception as e:
-        log.warning(f"⚠️ Не удалось получить статистику {threads_post_id}: {_safe_error(e)}")
-        return None
-
-
-def collect_insights(threads_ids: list[str]) -> dict[str, int] | None:
-    """Сумма метрик по всем частям треда. None, если хоть одна часть не
-    ответила — неполную сумму не записываем."""
-    totals: dict[str, int] = {}
-    for tid in threads_ids:
-        stats = get_post_insights(tid)
-        if stats is None:
-            return None
-        for name, value in stats.items():
-            totals[name] = totals.get(name, 0) + value
-        time.sleep(1)
-    return totals
-
-
-def get_permalink(threads_post_id: str) -> str | None:
-    """Ссылка на пост в Threads (её выдаёт только API). None при ошибке."""
-    try:
-        r = request_with_retry(
-            "GET",
-            f"{API_BASE}/{threads_post_id}",
-            params={"fields": "permalink", "access_token": THREADS_TOKEN},
-            timeout=API_TIMEOUT_SEC,
-        )
-        link = r.json().get("permalink")
-        return link if isinstance(link, str) and link.startswith("https://") else None
-    except Exception as e:
-        log.warning(f"⚠️ Не удалось получить ссылку {threads_post_id}: {_safe_error(e)}")
-        return None
-
-
-def update_publication_stats(pub_id: str, stats: dict[str, int], permalink: str | None = None):
-    payload: dict = {**stats, "stats_checked_at": datetime.now(tz=TZ).isoformat()}
-    if permalink:
-        payload["permalink"] = permalink
-    try:
-        request_with_retry(
-            "PATCH",
-            f"{WORKSPACE_API_URL}/api/v1/publications/{pub_id}",
-            headers={"X-API-Key": WORKSPACE_API_KEY},
-            json=payload,
-            timeout=API_TIMEOUT_SEC,
-        )
-    except Exception as e:
-        log.error(f"❌ Не удалось обновить статистику публикации {pub_id}: {e}")
-
-
-def check_engagement():
-    """Раз в день опрашивает лайки/охваты по всем публикациям за последние
-    STATS_WINDOW_DAYS дней — и для 'обычных' постов (на случай, что залетели),
-    и для 'стволов' (branch_count > 2), чтобы копить статистику для анализа."""
-    log.info("📊 Опрос статистики вовлечённости")
-
-    validate_config()
-    validate_threads_token()
-
-    since = datetime.now(tz=TZ) - timedelta(days=STATS_WINDOW_DAYS)
-    publications = load_recent_publications(since)
-    log.info(f"🔎 Публикаций для опроса: {len(publications)}")
-
-    checked = 0
-    for pub in publications:
-        pub_id = pub.get("id")
-        threads_ids = pub.get("threads_ids") or []
-        if not threads_ids:
-            continue
-        try:
-            # Для тредов из нескольких частей суммируем метрики по всем частям.
-            stats = collect_insights(threads_ids)
-            if stats is None:
-                continue
-            # Ссылку на пост просим, только если Workspace её уже хранит (поле
-            # есть в ответе) и она ещё не записана.
-            permalink = get_permalink(threads_ids[0]) if "permalink" in pub and not pub.get("permalink") else None
-            update_publication_stats(pub_id, stats, permalink)
-            checked += 1
-        except Exception as e:
-            log.exception(f"❌ Ошибка опроса публикации {str(pub_id)[:8]}...: {e}")
-
-    log.info(f"🏁 Готово. Проверено: {checked}")
-
-    backfill_permalinks()
-    backfill_engagement()
-
-
-# ─── Снимки статистики свежих постов (залёты) ────────────────────────────────
-# Решение Основателя 30.09: первые 6 часов — раз в 30 минут, до 48 часов —
-# раз в 3 часа, дальше не снимаем. Запуск --snapshots — каждые 30 минут.
-SNAPSHOT_SCHEDULE = ((6 * 60, 30), (48 * 60, 180))  # (до возраста, мин; интервал, мин)
-SNAPSHOT_SLACK_MIN = 5  # cron GitHub Actions опаздывает — не пропускаем снимок из-за пары минут
-
-
-def snapshot_due(published_at: datetime, last_snapshot_at: datetime | None, now: datetime) -> bool:
-    age_min = (now - published_at).total_seconds() / 60
-    for until_min, every_min in SNAPSHOT_SCHEDULE:
-        if age_min < until_min:
-            if last_snapshot_at is None:
-                return True
-            return (now - last_snapshot_at).total_seconds() / 60 >= every_min - SNAPSHOT_SLACK_MIN
-    return False
-
-
-def _parse_time(value: str | None) -> datetime | None:
-    if not value:
-        return None
-    try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-
-
-def take_snapshots():
-    """Снимки статистики публикаций младше 48 часов — по расписанию snapshot_due."""
-    log.info("📸 Снимки статистики свежих постов")
-    validate_config()
-    validate_threads_token()
-
-    now = datetime.now(tz=TZ)
-    publications = load_recent_publications(now - timedelta(hours=48))
-    taken = 0
-    for pub in publications:
-        published_at = _parse_time(pub.get("published_at"))
-        threads_ids = pub.get("threads_ids") or []
-        if not published_at or not threads_ids:
-            continue
-        if not snapshot_due(published_at, _parse_time(pub.get("last_snapshot_at")), now):
-            continue
-        try:
-            stats = collect_insights(threads_ids)
-            if stats is None:
-                continue
-            request_with_retry(
-                "POST",
-                f"{WORKSPACE_API_URL}/api/v1/publications/{pub['id']}/snapshots",
-                headers={"X-API-Key": WORKSPACE_API_KEY},
-                json=stats,
-                timeout=API_TIMEOUT_SEC,
-            )
-            taken += 1
-        except Exception as e:
-            log.error(f"❌ Снимок публикации {str(pub.get('id'))[:8]}... не сохранён: {_safe_error(e)}")
-    log.info(f"🏁 Снимков: {taken} (публикаций за 48 ч: {len(publications)})")
-
-
-def backfill_permalinks():
-    """Проставляет ссылки на посты в Threads публикациям архива, у которых их
-    ещё нет (в том числе старым, вне окна статистики) — порциями, чтобы
-    уложиться в таймаут запуска."""
-    try:
-        r = request_with_retry(
-            "GET",
-            f"{WORKSPACE_API_URL}/api/v1/publications",
-            params={"missing_permalink": "1"},
-            headers={"X-API-Key": WORKSPACE_API_KEY},
-            timeout=API_TIMEOUT_SEC,
-        )
-        publications = r.json().get("publications", [])
-    except Exception as e:
-        log.error(f"❌ Не удалось получить публикации без ссылок: {e}")
-        return
-
-    # Версия Workspace без поддержки ссылок не отдаёт поле permalink —
-    # тогда дозаполнять некуда.
-    if not publications or "permalink" not in publications[0]:
-        return
-
-    batch = [p for p in publications if not p.get("permalink") and p.get("threads_ids")][:PERMALINK_BACKFILL_PER_RUN]
-    log.info(f"🔗 Ссылок без записи: {len(publications)}, проставляем: {len(batch)}")
-    saved = 0
-    for pub in batch:
-        link = get_permalink(pub["threads_ids"][0])
-        if link:
-            try:
-                request_with_retry(
-                    "PATCH",
-                    f"{WORKSPACE_API_URL}/api/v1/publications/{pub['id']}",
-                    headers={"X-API-Key": WORKSPACE_API_KEY},
-                    json={"permalink": link},
-                    timeout=API_TIMEOUT_SEC,
-                )
-                saved += 1
-            except Exception as e:
-                log.error(f"❌ Не удалось сохранить ссылку публикации {str(pub['id'])[:8]}...: {e}")
-        time.sleep(1)
-    log.info(f"🔗 Ссылок сохранено: {saved}")
-
-
-def backfill_engagement():
-    """Собирает ответы, репосты, цитаты и «поделились» для публикаций, где их
-    ещё нет (старый архив вне окна статистики) — порциями, чтобы уложиться в
-    таймаут запуска."""
-    try:
-        r = request_with_retry(
-            "GET",
-            f"{WORKSPACE_API_URL}/api/v1/publications",
-            params={"missing_engagement": "1"},
-            headers={"X-API-Key": WORKSPACE_API_KEY},
-            timeout=API_TIMEOUT_SEC,
-        )
-        publications = r.json().get("publications", [])
-    except Exception as e:
-        log.error(f"❌ Не удалось получить публикации без полной статистики: {e}")
-        return
-
-    # Версия Workspace без этих полей не отдаёт replies — тогда записывать некуда.
-    if not publications or "replies" not in publications[0]:
-        return
-
-    batch = [p for p in publications if p.get("replies") is None and p.get("threads_ids")][:ENGAGEMENT_BACKFILL_PER_RUN]
-    log.info(f"💬 Без полной статистики: {len(publications)}, собираем: {len(batch)}")
-    saved = 0
-    for pub in batch:
-        stats = collect_insights(pub["threads_ids"])
-        if stats is None:
-            continue
-        update_publication_stats(pub["id"], stats)
-        saved += 1
-    log.info(f"💬 Статистики сохранено: {saved}")
+        log.error(f"❌ Ошибка публикации: {_safe_error(e)}")
+        return post_ids, _safe_error(e)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -917,22 +759,27 @@ def publish_threads_post(post: dict) -> bool:
         report_failure(post_id, "threads", msg)
         return False
 
-    log.info(f"🕐 Threads: публикуем {post_id[:8]}... ({len(parts)} частей)")
+    # Части, вышедшие в прошлой попытке (ошибка на середине ветки), — их
+    # отдаёт сервер: продолжаем с них, а не публикуем ветку заново.
+    done = [i for i in (post.get("partial_ids") or []) if isinstance(i, str) and _SAFE_ID_RE.match(i)][:len(parts)]
+    log.info(f"🕐 Threads: публикуем {post_id[:8]}... ({len(parts)} частей{f', уже вышло {len(done)}' if done else ''})")
     # Слот забираем до обращения к API площадки: если упадём между
-    # успешной публикацией и отчётом, слот останется занятым, и повтор
-    # случится не раньше чем через 15 минут — время заметить дубль.
+    # успешной публикацией и отчётом, слот останется занятым, а через
+    # 15 минут уйдёт в «проверьте Threads» — сам он не повторится.
     if not claim_platform(post_id, "threads"):
         return False
 
-    threads_ids, pub_error = publish_parts(parts, media=media or None)
-    if threads_ids:
+    threads_ids, pub_error = publish_parts(parts, media=media or None, done_ids=done)
+    if not pub_error:
         log.info("Threads IDs for %s: %s", post_id, threads_ids)
         report_published(post_id, "threads", threads_ids)
         log.info(f"✅ Threads: пост {post_id[:8]}... опубликован")
         return True
 
-    log.error(f"❌ Threads: пост {post_id[:8]}...: {pub_error or 'ошибка публикации'}")
-    report_failure(post_id, "threads", pub_error or "ошибка публикации")
+    if threads_ids:
+        pub_error = f"Вышло частей: {len(threads_ids)} из {len(parts)} — «Повторить» допубликует остальные. {pub_error}"
+    log.error(f"❌ Threads: пост {post_id[:8]}...: {pub_error}")
+    report_failure(post_id, "threads", pub_error, external_ids=threads_ids)
     return False
 
 
@@ -960,7 +807,7 @@ def publish_instagram_post(post: dict, account_id: str, token: str) -> bool:
         log.info(f"✅ Instagram: рилс {post_id[:8]}... опубликован")
         return True
 
-    log.error(f"❌ Instagram: пост {post_id[:8]}...: {error}")
+    log.error(f"❌ Instagram: пост {post_id[:8]}...: {redact(error)}")
     report_failure(post_id, "instagram", error or "ошибка публикации")
     return False
 
@@ -982,6 +829,7 @@ def instagram_account() -> tuple[str, str] | None:
 
     account_id = stored.get("account_id")
     access_token = stored.get("access_token")
+    add_secret(access_token)
     if not account_id or not access_token:
         log.error("❌ Instagram подключён не полностью: нет account_id или токена")
         return None
@@ -998,6 +846,7 @@ def instagram_account() -> tuple[str, str] | None:
         return account_id, access_token
 
     new_token, expires_in, error = instagram.refresh_token(access_token)
+    add_secret(new_token)
     if error:
         # Не фатально: старый токен ещё жив, публикуем на нём.
         log.error(f"❌ {error} (осталось {days_left} дн.)")
@@ -1100,7 +949,9 @@ def youtube_account() -> tuple[str, str] | None:
         log.error("❌ GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET не заданы — обновить токен YouTube нечем")
         return None
 
+    add_secret(refresh)
     new_token, expires_in, error = youtube.refresh_token(refresh, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET)
+    add_secret(new_token)
     if error:
         log.error(f"❌ {error}")
         return None
@@ -1136,7 +987,10 @@ def tiktok_account() -> tuple[str, str] | None:
         log.error("❌ TIKTOK_CLIENT_KEY/TIKTOK_CLIENT_SECRET не заданы — обновить токен TikTok нечем")
         return None
 
+    add_secret(refresh)
     new_token, new_refresh, expires_in, error = tiktok.refresh_token(refresh, TIKTOK_CLIENT_KEY, TIKTOK_CLIENT_SECRET)
+    add_secret(new_token)
+    add_secret(new_refresh)
     if error:
         log.error(f"❌ {error}")
         return None
@@ -1155,13 +1009,12 @@ def run():
     log.info("🚀 Scheduler: запуск")
 
     validate_config()
-    validate_threads_token()
 
     now = datetime.now(tz=TZ)
 
-    # Ежедневная очистка опубликованных постов — на первом часе вечернего окна
-    # (18:xx больше не подходит: скрипт теперь не крутится вне окон публикации).
-    if now.hour == 19:
+    # Ежедневная очистка опубликованных постов — раз в сутки, в 19:00–19:04
+    # МСК (запуск идёт каждые 5 минут).
+    if now.hour == 19 and now.minute < 5:
         delete_published_posts(now)
 
     published = 0
@@ -1175,6 +1028,14 @@ def run():
             continue
 
         account = None
+        if platform == "threads":
+            # Токен проверяем, только когда есть что публиковать, — и его сбой
+            # не мешает Instagram, YouTube и TikTok.
+            token_problem = validate_threads_token()
+            if token_problem:
+                for post in posts:
+                    report_failure(post["id"], "threads", token_problem)
+                continue
         if platform in ("instagram", "youtube", "tiktok"):
             account = {"instagram": instagram_account, "youtube": youtube_account, "tiktok": tiktok_account}[platform]()
             if not account:
@@ -1189,8 +1050,8 @@ def run():
                 if queued_at.tzinfo is None:
                     queued_at = queued_at.replace(tzinfo=TZ)
                 if now - queued_at > timedelta(hours=STALE_QUEUE_HOURS):
-                    log.error(f"❌ {platform}: пост {post_id[:8]}... висит в очереди дольше {STALE_QUEUE_HOURS}ч — снимаю")
-                    report_failure(post_id, platform, f"Публикация не завершилась за {STALE_QUEUE_HOURS}ч подряд — вероятно, зависает job, проверьте вручную")
+                    log.error(f"❌ {platform}: пост {post_id[:8]}... опоздал больше чем на {STALE_QUEUE_HOURS}ч — снимаю")
+                    report_failure(post_id, platform, f"Время публикации прошло больше {STALE_QUEUE_HOURS} ч назад, а пост не вышел (запуски не шли или падали) — поставьте новое время")
                     continue
             try:
                 if paced:
@@ -1208,19 +1069,29 @@ def run():
                     published += 1
                     paced = True
             except Exception as e:
-                log.exception(f"❌ Непредвиденная ошибка ({platform}, пост {str(post_id)[:8]}...): {e}")
+                log.exception(f"❌ Непредвиденная ошибка ({platform}, пост {str(post_id)[:8]}...): {_safe_error(e)}")
                 try:
-                    report_failure(post_id, platform, f"Проверьте площадку перед повтором: {e}")
+                    report_failure(post_id, platform, f"Проверьте площадку перед повтором: {_safe_error(e)}")
                 except Exception:
                     pass
 
     log.info(f"🏁 Готово. Опубликовано: {published}")
+    heartbeat(published)
+
+
+def heartbeat(published: int):
+    """«Пульс» в Workspace: экран «Сегодня» покажет, если планировщик молчит."""
+    try:
+        requests.post(f"{WORKSPACE_API_URL}/api/v1/pulse", headers={"X-API-Key": WORKSPACE_API_KEY},
+                      json={"agent": "scheduler", "ok": True, "detail": f"опубликовано: {published}"}, timeout=10)
+    except requests.RequestException:
+        pass
 
 
 if __name__ == "__main__":
-    if "--stats" in sys.argv:
-        check_engagement()
-    elif "--snapshots" in sys.argv:
-        take_snapshots()
+    # Статистика и снимки свежих постов теперь собирает сам Workspace
+    # (pg_cron → /api/threads/stats/tick) — без GitHub и без ПК.
+    if "--stats" in sys.argv or "--snapshots" in sys.argv:
+        log.info("ℹ️ Статистику собирает Workspace — планировщик только публикует")
     else:
         run()
