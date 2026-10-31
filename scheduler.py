@@ -480,10 +480,14 @@ def parse_thread(text: str) -> list[str]:
     return parts if parts else [text.strip()]
 
 
-# Метка поста в ссылках на сайт: ?utm_source=threads&utm_content=<6 знаков id
-# поста>. По ней Workspace раскладывает клики Threads и визиты Метрики по
-# постам. То же правило — lib/post-links.ts в Workspace.
-_SITE_LINK_RE = re.compile(r'(?:https?://)?(?:www\.)?ioannpolevoi\.com(?:/[^\s<>"«»]*)?', re.IGNORECASE)
+# Метка поста в ссылках: на сайт — ?utm_source=threads&utm_content=<6 знаков id
+# поста>, на канал (t.me/+приглашение) — ?utm_content=<…> (Telegram открывает
+# тот же канал, проверено 01.11.2026). По ней Workspace раскладывает клики
+# Threads и визиты Метрики по постам. То же правило — lib/post-links.ts в Workspace.
+_LINK_RE = re.compile(
+    r'(?:https?://)?(?:www\.)?ioannpolevoi\.com(?:/[^\s<>"«»]*)?'
+    r'|(?:https?://)?t\.me/\+[A-Za-z0-9_-]+(?:[?#][^\s<>"«»]*)?',
+    re.IGNORECASE)
 _TRAILING_RE = re.compile(r'[.,!?;:…)\]]+$')
 
 
@@ -496,18 +500,19 @@ def _tag_url(url: str, tag: str) -> str:
         return url
     base, sep, fragment = url.partition("#")
     joiner = "&" if "?" in base else "?"
-    return f"{base}{joiner}utm_source=threads&utm_content={tag}{sep}{fragment}"
+    params = f"utm_content={tag}" if re.search(r't\.me/', base, re.IGNORECASE) else f"utm_source=threads&utm_content={tag}"
+    return f"{base}{joiner}{params}{sep}{fragment}"
 
 
-def tag_site_links(text: str, tag: str, limit: int = MAX_POST_LEN) -> str:
-    """Метит ссылки на сайт; если с меткой часть длиннее limit — оставляет как есть."""
+def tag_links(text: str, tag: str, limit: int = MAX_POST_LEN) -> str:
+    """Метит ссылки на сайт и канал; если с метками часть длиннее limit — оставляет как есть."""
     def repl(m: re.Match) -> str:
         match = m.group(0)
         tail_m = _TRAILING_RE.search(match)
         tail = tail_m.group(0) if tail_m else ""
         url = match[:len(match) - len(tail)] if tail else match
         return _tag_url(url, tag) + tail
-    tagged = _SITE_LINK_RE.sub(repl, text)
+    tagged = _LINK_RE.sub(repl, text)
     return text if len(tagged) > limit else tagged
 
 
@@ -792,7 +797,7 @@ def publish_threads_post(post: dict) -> bool:
 
     # Части, вышедшие в прошлой попытке (ошибка на середине ветки), — их
     # отдаёт сервер: продолжаем с них, а не публикуем ветку заново.
-    parts = [tag_site_links(t, post_tag(post_id)) for t in parts]
+    parts = [tag_links(t, post_tag(post_id)) for t in parts]
     done = [i for i in (post.get("partial_ids") or []) if isinstance(i, str) and _SAFE_ID_RE.match(i)][:len(parts)]
     log.info(f"🕐 Threads: публикуем {post_id[:8]}... ({len(parts)} частей{f', уже вышло {len(done)}' if done else ''})")
     # Слот забираем до обращения к API площадки: если упадём между
