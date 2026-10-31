@@ -39,6 +39,18 @@ class ParseTest(unittest.TestCase):
     def test_spoilers(self):
         self.assertEqual(s.parse_spoilers("x ||y|| z"), ("x y z", [{"entity_type": "SPOILER", "offset": 2, "length": 1}]))
 
+    def test_site_links_get_post_tag(self):
+        tag = s.post_tag("fab1c547-1218-4b58-a74a-74dab3f34998")
+        self.assertEqual(tag, "fab1c5")
+        self.assertEqual(
+            s.tag_site_links("Статья: https://ioannpolevoi.com/notes/x/. И t.me/+abc", tag),
+            "Статья: https://ioannpolevoi.com/notes/x/?utm_source=threads&utm_content=fab1c5. И t.me/+abc")
+        self.assertEqual(s.tag_site_links("ioannpolevoi.com/about?a=1#q", "ab"), "ioannpolevoi.com/about?a=1&utm_source=threads&utm_content=ab#q")
+        already = "https://ioannpolevoi.com/?utm_source=x"
+        self.assertEqual(s.tag_site_links(already, "ab"), already)
+        long_text = "я" * 470 + " https://ioannpolevoi.com/"
+        self.assertEqual(s.tag_site_links(long_text, "ab"), long_text)  # с меткой длиннее 500 — без метки
+
 
 class PublishTest(unittest.TestCase):
     def test_lost_publish_response_is_not_retried(self):
