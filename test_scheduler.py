@@ -50,7 +50,9 @@ class ParseTest(unittest.TestCase):
         already = "https://ioannpolevoi.com/?utm_source=x"
         self.assertEqual(s.tag_links(already, "ab"), already)
         long_text = "я" * 470 + " https://ioannpolevoi.com/"
-        self.assertEqual(s.tag_links(long_text, "ab"), long_text)  # с меткой длиннее 500 — без метки
+        with self.assertLogs(s.log, "WARNING") as logs:
+            self.assertEqual(s.tag_links(long_text, "ab"), long_text)  # с меткой длиннее 500 — без метки
+        self.assertIn("снята", logs.output[0])  # и это видно в журнале, а не пропадает молча
 
 
 class PublishTest(unittest.TestCase):

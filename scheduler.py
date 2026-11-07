@@ -513,7 +513,12 @@ def tag_links(text: str, tag: str, limit: int = MAX_POST_LEN) -> str:
         url = match[:len(match) - len(tail)] if tail else match
         return _tag_url(url, tag) + tail
     tagged = _LINK_RE.sub(repl, text)
-    return text if len(tagged) > limit else tagged
+    if len(tagged) > limit:
+        # Заранее об этом предупреждает сторож Workspace, пост ещё в очереди. Если дошло
+        # до публикации, след остаётся в журнале запуска: клики этой части не лягут на пост.
+        log.warning(f"⚠️ Метка {tag} снята: с ней часть длиннее {limit} на {len(tagged) - limit} знаков — клики не попадут на пост")
+        return text
+    return tagged
 
 
 # ═════════════════════════════════════════════════════════════════════════════
